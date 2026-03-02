@@ -1,0 +1,5 @@
+build/
+*.log
+*.o
+web_server
+*.swp
