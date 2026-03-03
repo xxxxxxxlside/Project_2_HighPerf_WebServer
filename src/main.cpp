@@ -102,16 +102,90 @@ int main() {
     // =========================================================================
     // 第六步：打印日志与保持运行
     // =========================================================================
+
+    // ... (前面的 socket, bind, listen 代码保持不变) ...
     std::cout << ">>> Server started successfully!" << std::endl;
     std::cout << ">>> Listening on port 8080..." << std::endl;
-    std::cout << ">>> WSL2 Tip: Find your IP using 'ip addr show eth0' to connect from Windows." << std::endl;
     std::cout << ">>> Press Ctrl+C to stop." << std::endl;
     
-    // 【死循环】：保持进程存活
-    // 如果 main 函数执行完，进程就会退出，socket 会关闭，服务器就停了。
-    // 我们需要它一直跑着，等待事件发生。
+    // 用于存储所有已连接的客户端 fd (简单期间，今天先不用map，只用一个变量演示)
+    // 实际项目中会用 unordered_map, Connection*> 管理
+    int client_fd = -1;
+
     while (true) {
-        sleep(1); // 休眠 1 秒。【优化点】：如果不 sleep，CPU 会以 100% 占用率空转 (忙等)，浪费资源。
+        // -------------------------------------------
+        // 核心动作：接受连接 (Accept)
+        // -------------------------------------------
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        // accept 是一个阻塞函数：如果没有人连接，程序员会停在这里等待
+        // 一旦有人连接，它会返回一个新的 fd (client_fd), 专门用于和这个客户通信
+        client_fd = accept(listen_fd,(struct sockaddr*)&client_addr,&client_len);
+
+        if (client_fd < 0) {
+            // 如果出错 (比如被信号中断)，打印错误并继续循环
+            std::cerr << "accept failed" << std::endl;
+            continue;
+        }
+        
+        // -------------------------------------------------
+        // 【关键步骤】，设置非阻塞模式 (Non-blocking)
+        // -------------------------------------------------
+        // 为什么必须做？
+        // 如果后续 read/write 时没有数据，阻塞模式会让整个服务器卡死。
+        // 设置为非阻塞后，如果没有数据，read会立即返回 -1 (errno = EAGAIN), 而不是卡住。
+        // 这是下周使用 Epoll 的前提条件
+        int flags = fcntl(client_fd, F_GETFL, 0); // 获取当前标志
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK); // 加上 O_NONBLOCK 标志
+
+        // -------------------------------------------------
+        // 打印连接信息
+        // -------------------------------------------------
+        // 将客户端 IP 从网络字节序换位字符串
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+
+        std::cout << ">>> New connection accepted!" << std::endl;
+        std::cout << "      Client IP: " << client_ip << std::endl;
+        std::cout << "      Client Port: " << ntohs(client_addr.sin_port) << std::endl;
+        std::cout << "      Client FD: " << client_fd << std::endl;
+        std::cout << "      Status: Non-blocking set." << std::endl;
+        std::cout << "-------------------------------" << std::endl;
+
+        // ---------------------------------------------------
+        // 简单测试，接收数据（今天先不做负责处理，只读一下试试）
+        // ---------------------------------------------------
+        char buffer[1024] = {0};
+        // 尝试读取数据
+        ssize_t n = read(client_fd, buffer, sizeof(buffer));
+
+        if (n > 0) {
+            std::cout << ">>> Recelved data from client: " << buffer << std::endl;
+
+            // 简单回显 (Echo)
+            write(client_fd, buffer, n);
+        } else if (n == 0) {
+            // n=0 表示客户端正常关闭连接
+            std::cout << ">>> Client disconnected normally." << std::endl;
+            close(client_fd); // 关闭 fd, 释放资源
+            client_fd = -1;   // 重置标记
+        } else {
+            // n<0 且 errno == EAGAIN 表示暂时没数据 (因为是非阻塞)
+            // 其他错误则关闭
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::cerr << "read error, closing connection." << std::endl;
+                close(client_fd);
+                client_fd = -1;
+            } else {
+                // 非阻塞模式下，没数据是常态，这里可以选择不打印或者打印调试信息
+                // std::cout << "No data avaliable right now (EAGAIN)." << std::endl;
+            }
+        }
+
+        // 注意：今天的代码是一次性处理，处理完就关闭连接或继续等待下一个 accept
+        // 下周引入 Epoll 后，我们会同时管理多个连接
+
     }
 
     // 清理资源 (正常流程不会走到这里，只有 Ctrl+C 中断或出错返回时才会涉及清理)
