@@ -10,6 +10,9 @@
                           // 这是网络编程最核心的头文件
 #include <fcntl.h>        // [File Control] 文件控制库 (核心函数: fcntl)
                           // 用于设置文件描述符的属性，比如最重要的“非阻塞模式”
+  
+#include <sys/epoll.h>    // [新增] Epoll 核心头文件
+#include <errno.h>
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -99,97 +102,136 @@ int main() {
     // 128 表示队列最多容纳 128 个等待中的连接，超过的直接拒绝。
     CHECK_RET(listen(listen_fd, 128), "listen failed");
 
-    // =========================================================================
-    // 第六步：打印日志与保持运行
-    // =========================================================================
 
-    // ... (前面的 socket, bind, listen 代码保持不变) ...
-    std::cout << ">>> Server started successfully!" << std::endl;
-    std::cout << ">>> Listening on port 8080..." << std::endl;
-    std::cout << ">>> Press Ctrl+C to stop." << std::endl;
-    
-    // 用于存储所有已连接的客户端 fd (简单期间，今天先不用map，只用一个变量演示)
-    // 实际项目中会用 unordered_map, Connection*> 管理
-    int client_fd = -1;
+    // ... (前面的 socket, setsockopt,bind, listen 代码保持不变) ...
+    // 请保留直到 listen() 成功的所有代码
 
-    while (true) {
-        // -------------------------------------------
-        // 核心动作：接受连接 (Accept)
-        // -------------------------------------------
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
+    // 假设 listen_fd 已经创建并 listen 成功
+    std::cout << ">>> Server started! Switching to Epoll mode ..." << std::endl;
 
-        // accept 是一个阻塞函数：如果没有人连接，程序员会停在这里等待
-        // 一旦有人连接，它会返回一个新的 fd (client_fd), 专门用于和这个客户通信
-        client_fd = accept(listen_fd,(struct sockaddr*)&client_addr,&client_len);
-
-        if (client_fd < 0) {
-            // 如果出错 (比如被信号中断)，打印错误并继续循环
-            std::cerr << "accept failed" << std::endl;
-            continue;
-        }
-        
-        // -------------------------------------------------
-        // 【关键步骤】，设置非阻塞模式 (Non-blocking)
-        // -------------------------------------------------
-        // 为什么必须做？
-        // 如果后续 read/write 时没有数据，阻塞模式会让整个服务器卡死。
-        // 设置为非阻塞后，如果没有数据，read会立即返回 -1 (errno = EAGAIN), 而不是卡住。
-        // 这是下周使用 Epoll 的前提条件
-        int flags = fcntl(client_fd, F_GETFL, 0); // 获取当前标志
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK); // 加上 O_NONBLOCK 标志
-
-        // -------------------------------------------------
-        // 打印连接信息
-        // -------------------------------------------------
-        // 将客户端 IP 从网络字节序换位字符串
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-
-        std::cout << ">>> New connection accepted!" << std::endl;
-        std::cout << "      Client IP: " << client_ip << std::endl;
-        std::cout << "      Client Port: " << ntohs(client_addr.sin_port) << std::endl;
-        std::cout << "      Client FD: " << client_fd << std::endl;
-        std::cout << "      Status: Non-blocking set." << std::endl;
-        std::cout << "-------------------------------" << std::endl;
-
-        // ---------------------------------------------------
-        // 简单测试，接收数据（今天先不做负责处理，只读一下试试）
-        // ---------------------------------------------------
-        char buffer[1024] = {0};
-        // 尝试读取数据
-        ssize_t n = read(client_fd, buffer, sizeof(buffer));
-
-        if (n > 0) {
-            std::cout << ">>> Recelved data from client: " << buffer << std::endl;
-
-            // 简单回显 (Echo)
-            write(client_fd, buffer, n);
-        } else if (n == 0) {
-            // n=0 表示客户端正常关闭连接
-            std::cout << ">>> Client disconnected normally." << std::endl;
-            close(client_fd); // 关闭 fd, 释放资源
-            client_fd = -1;   // 重置标记
-        } else {
-            // n<0 且 errno == EAGAIN 表示暂时没数据 (因为是非阻塞)
-            // 其他错误则关闭
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                std::cerr << "read error, closing connection." << std::endl;
-                close(client_fd);
-                client_fd = -1;
-            } else {
-                // 非阻塞模式下，没数据是常态，这里可以选择不打印或者打印调试信息
-                // std::cout << "No data avaliable right now (EAGAIN)." << std::endl;
-            }
-        }
-
-        // 注意：今天的代码是一次性处理，处理完就关闭连接或继续等待下一个 accept
-        // 下周引入 Epoll 后，我们会同时管理多个连接
-
+    // --------------------------------------------
+    // 1. 创建 Epoll 实例
+    // --------------------------------------------
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        std::cerr << "epoll_create1 failed" << std::endl;
+        return -1;
     }
 
-    // 清理资源 (正常流程不会走到这里，只有 Ctrl+C 中断或出错返回时才会涉及清理)
-    close(listen_fd); // 关闭 socket，释放内核资源
 
+    // ------------------------------------------
+    // 2. 创建事件结构体，准备注册 listen_fd
+    // ------------------------------------------
+    struct epoll_event event;
+    event.events = EPOLLIN;         // 我们关心“读”事件（有新连接也是读事件的一种）
+    event.data.fd = listen_fd;      // 把 listen_fd 绑定到这个事件上
+
+
+    // ------------------------------------------
+    // 3. 将 listen_fd 添加到 Epoll 监听列表
+    // ------------------------------------------
+    // EPOLL_CTL_ADD: 添加操作
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
+        std::cerr << "epoll_ctl ADD failed" << std::endl;
+        return -1; 
+    }
+
+    std::cout << ">>> Epoll initialized. Listening for events..." << std::endl;
+
+    // -------------------------------------------
+    // 4. 事件循环 (Event Loop) - 服务器的核心心脏
+    // -------------------------------------------
+    struct epoll_event events[128]; // 用于存放就绪的事件数组
+
+    while (true) {
+        // 【核心】等待事件发生
+        // 参数：
+        // 1. epoll_fd: 监听哪个 epoll 实例
+        // 2. events: 数组，用来存“谁准备好了”
+        // 3. 128: 最多存多少个事件
+        // 4. -1: 无限等待 (阻塞), 直到有事件发生
+        int nfds = epoll_wait(epoll_fd, events, 128, -1);
+
+        if (nfds == -1) {
+            std::cerr << "epoll_wait failed" << std::endl;
+            break;
+        }
+
+        // 遍历所有就绪的事件
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
+
+            if (fd == listen_fd) {
+                // --------------------------------------
+                // 情况A: listen_fd 就绪 -> 有新连接来了!
+                // --------------------------------------
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+
+                // 接受连接
+                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+                if (client_fd == -1) {
+                    std::cerr << "accept failed" << std::endl;
+                    continue;
+                }
+
+                // 【关键】设置非阻塞(必须!)
+                int flags = fcntl(client_fd, F_GETFL, 0);
+                fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+                // 打印日志
+                char client_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
+
+                // 【新增】将连接的 client_fd 也加入 Epoll 监听!
+                // 这样下次它有数据时, epoll_wait 也会通知我们
+                struct epoll_event client_event;
+                client_event.events = EPOLLIN;  // 关心它的读事件
+                client_event.data.fd = client_fd;
+
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                    std::cerr << "epoll_ctl ADD client failed" << std::endl;
+                    close (client_fd);
+                } else {
+                    std::cout << "      -> Added to Epoll watch list." << std::endl;
+                }
+            } else {
+                // --------------------------------------------------
+                // 情况 B: 某个 client_fd 就绪 -> 有数据来了! 或者断开了
+                // --------------------------------------------------
+                char buffer[1024] = {0};
+                ssize_t n = read (fd, buffer, sizeof(buffer));
+
+                if (n > 0) {
+                    // 收到数据
+                    std::cout << ">>> Data from FD" << fd << ": " << buffer << std::endl;
+                    // 简单回显
+                    write(fd, buffer, n);
+
+                } else if ( n == 0) {
+                    // 客户端正常关闭 (read 返回 0)
+                    std::cout << ">>> Client FD " << fd << "disconnected." << std::endl;
+                    close(fd);
+                    // 【重要】从 Epoll 中移除该 fd (虽然进程退出会自动移除，但养成好习惯)
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                } else {
+                    // 出错了
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // 非阻塞模式下，没数据是正常现象，忽略
+                    } else {
+                        std::cerr << "Read error on FD " << fd << ", closing." << std::endl;
+                        close(fd);
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    }
+                }
+            }
+        }
+    }
+
+    close (listen_fd);
+    close (epoll_fd);
     return 0;
+
+    
 }
