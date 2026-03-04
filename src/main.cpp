@@ -13,6 +13,9 @@
   
 #include <sys/epoll.h>    // [新增] Epoll 核心头文件
 #include <errno.h>
+// [Day 4 新增] 引入 string 和 unordered_map
+#include <string>
+#include <unordered_map>
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -25,6 +28,18 @@
         std::cerr << "Error: " << msg << " (errno: " << errno << ")" << std::endl; \
         return -1; \
     }
+
+// ============================================================================
+// [Day 4 新增] 全局数据结构定义
+// ============================================================================
+
+// 连接状态结构体
+struct Connection {
+    std::string in_buffer; // 动态缓冲区，累积数据
+};
+
+// 全局地图：fd -> Connection 对象
+std::unordered_map<int, Connection> connections;
 
 int main() {
     // =========================================================================
@@ -139,7 +154,7 @@ int main() {
     std::cout << ">>> Epoll initialized. Listening for events..." << std::endl;
 
     // -------------------------------------------
-    // 4. 事件循环 (Event Loop) - 服务器的核心心脏
+    // 事件循环 (Event Loop) - [Day 4 核心修改区]
     // -------------------------------------------
     struct epoll_event events[128]; // 用于存放就绪的事件数组
 
@@ -163,7 +178,7 @@ int main() {
 
             if (fd == listen_fd) {
                 // --------------------------------------
-                // 情况A: listen_fd 就绪 -> 有新连接来了!
+                // 情况A: 新连接 (基本不变，仅增加 Map 初始化)
                 // --------------------------------------
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
@@ -195,33 +210,77 @@ int main() {
                     close (client_fd);
                 } else {
                     std::cout << "      -> Added to Epoll watch list." << std::endl;
+                    // [Day 4 新增] 在 Map 中注册新连接，初始化空 Buffer
+                    connections[client_fd] = Connection();
                 }
             } else {
                 // --------------------------------------------------
-                // 情况 B: 某个 client_fd 就绪 -> 有数据来了! 或者断开了
+                // 情况 B: 客户端数据达到 (Day 4 彻底重写)
                 // --------------------------------------------------
-                char buffer[1024] = {0};
-                ssize_t n = read (fd, buffer, sizeof(buffer));
+                
+                // 1. 安全检查：确保 map 里有这个 fd
+                if (connections.find(fd) == connections.end()) {
+                    // 理论上不应该发生，除非并发竞争或逻辑错误
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
+                    continue;
+                }
+                
+                Connection& conn = connections[fd];
+                char temp_buf[4096];  // 临时栈缓冲，仅用于接收
+
+                ssize_t n = read(fd, temp_buf, sizeof(temp_buf));
+
+        
 
                 if (n > 0) {
-                    // 收到数据
-                    std::cout << ">>> Data from FD" << fd << ": " << buffer << std::endl;
-                    // 简单回显
-                    write(fd, buffer, n);
+                    // [Day 4 核心] 追加数据到动态 Buffer
+                    conn.in_buffer.append(temp_buf, n);
+
+                    // [Day 4 核心] 检查是否有完整 HTTP 请求头 (\r\n\r\n)
+                    std::size_t pos = conn.in_buffer.find("\r\n\r\n");
+
+                    if (pos != std::string::npos) {
+                        // 发现完整请求
+                        std::string request_header = conn.in_buffer.substr(0, pos + 4);
+                        std::cout << ">>> [Complete Request from FD " << fd << "]:\n" << request_header << std::endl;
+                        //构造响应
+                        std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                        write(fd, response.c_str(), response.size());
+
+                        // [Day 4 核心] 清理已处理的数据 (支持粘包多个请求)
+                        conn.in_buffer.erase(0, pos + 4);
+
+                        // 如果还有剩余数据且又构成完整请求, 可在此处递归或循环处理
+
+                        // 为简化代码, 依赖下一次 epoll 触发或此处简单再查一次
+                        while (!conn.in_buffer.empty() && (pos = conn.in_buffer.find("\r\n\r\n")) != std::string::npos) {
+                            std::string next_req = conn.in_buffer.substr(0, pos + 4);
+                            std::cout << ">>> [Pipelined Request from FD" << "]:\n" << next_req << std::endl;
+                            write(fd, response.c_str(), response.size());
+                            conn.in_buffer.erase(0, pos + 4);
+                        }
+                    } else {
+                         // ❌ 数据不全，保留在 buffer 中，等待下一次 read
+                        // std::cout << ">>> FD " << fd << " waiting for more data... (Current size: " << conn.in_buffer.size() << ")" << std::endl;
+
+                    }
 
                 } else if ( n == 0) {
-                    // 客户端正常关闭 (read 返回 0)
+                    // 客户端正常关闭 
                     std::cout << ">>> Client FD " << fd << "disconnected." << std::endl;
                     close(fd);
+                    connections.erase(fd); // [Day 4 新增] 清理 Map
                     // 【重要】从 Epoll 中移除该 fd (虽然进程退出会自动移除，但养成好习惯)
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                 } else {
-                    // 出错了
+                    // 错误处理
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // 非阻塞模式下，没数据是正常现象，忽略
+                        // 正常非阻塞返回
                     } else {
                         std::cerr << "Read error on FD " << fd << ", closing." << std::endl;
                         close(fd);
+                        connections.erase(fd);
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                     }
                 }
