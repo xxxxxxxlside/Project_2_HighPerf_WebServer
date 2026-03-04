@@ -16,6 +16,8 @@
 // [Day 4 新增] 引入 string 和 unordered_map
 #include <string>
 #include <unordered_map>
+#include <sstream>        // [Day 5 新增] 用于字符串串流解析，但我们暂用基础的 find 即可
+
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -118,14 +120,10 @@ int main() {
     CHECK_RET(listen(listen_fd, 128), "listen failed");
 
 
-    // ... (前面的 socket, setsockopt,bind, listen 代码保持不变) ...
-    // 请保留直到 listen() 成功的所有代码
-
-    // 假设 listen_fd 已经创建并 listen 成功
     std::cout << ">>> Server started! Switching to Epoll mode ..." << std::endl;
 
     // --------------------------------------------
-    // 1. 创建 Epoll 实例
+    // 1. 创建 Epoll 实例 Epoll 初始化与监听注册
     // --------------------------------------------
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
@@ -133,14 +131,12 @@ int main() {
         return -1;
     }
 
-
     // ------------------------------------------
     // 2. 创建事件结构体，准备注册 listen_fd
     // ------------------------------------------
     struct epoll_event event;
     event.events = EPOLLIN;         // 我们关心“读”事件（有新连接也是读事件的一种）
     event.data.fd = listen_fd;      // 把 listen_fd 绑定到这个事件上
-
 
     // ------------------------------------------
     // 3. 将 listen_fd 添加到 Epoll 监听列表
@@ -231,59 +227,93 @@ int main() {
 
                 ssize_t n = read(fd, temp_buf, sizeof(temp_buf));
 
-        
-
                 if (n > 0) {
                     // [Day 4 核心] 追加数据到动态 Buffer
                     conn.in_buffer.append(temp_buf, n);
 
-                    // [Day 4 核心] 检查是否有完整 HTTP 请求头 (\r\n\r\n)
+                    // ========= [Day 5 新增: Dos 防御 1 (Header > 8KB)] =========
+                    // 【修正版逻辑】：
+                    // 如果一直没找到 \r\n\r\n 且堆积长度超过8KB，或者找到的 \r\n\r\n 位置本身就超过了8KB
+                    // 这两种情况都代表了 Header 字段过大，直接触发 431 并断开连接
                     std::size_t pos = conn.in_buffer.find("\r\n\r\n");
+                    if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || 
+                        (pos != std::string::npos && pos > 8192)) {
+                        std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
+                        std::string resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+                        write(fd, resp.c_str(), resp.size());
+                        goto close_connection;
+                    }
 
-                    if (pos != std::string::npos) {
-                        // 发现完整请求
-                        std::string request_header = conn.in_buffer.substr(0, pos + 4);
-                        std::cout << ">>> [Complete Request from FD " << fd << "]:\n" << request_header << std::endl;
-                        //构造响应
-                        std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-                        write(fd, response.c_str(), response.size());
+                    // ====================================================
+                    // [Day 5 新增] HTTP 协议解析与边界校验
+                    // ====================================================
+                    while ((pos = conn.in_buffer.find("\r\n\r\n")) != std::string::npos) {
+                        std::string headers = conn.in_buffer.substr(0, pos);
+                        int header_total_len = pos + 4;
 
-                        // [Day 4 核心] 清理已处理的数据 (支持粘包多个请求)
-                        conn.in_buffer.erase(0, pos + 4);
-
-                        // 如果还有剩余数据且又构成完整请求, 可在此处递归或循环处理
-
-                        // 为简化代码, 依赖下一次 epoll 触发或此处简单再查一次
-                        while (!conn.in_buffer.empty() && (pos = conn.in_buffer.find("\r\n\r\n")) != std::string::npos) {
-                            std::string next_req = conn.in_buffer.substr(0, pos + 4);
-                            std::cout << ">>> [Pipelined Request from FD" << "]:\n" << next_req << std::endl;
-                            write(fd, response.c_str(), response.size());
-                            conn.in_buffer.erase(0, pos + 4);
+                        // 1. 解析 Request Line 
+                        std::size_t line_end = headers.find("\r\n");
+                        if (line_end != std::string::npos) {
+                            std::string request_line = headers.substr(0, line_end);
+                            std::cout << ">>> [Parse] FD " << fd << " Request: " << request_line << std::endl;
                         }
-                    } else {
-                         // ❌ 数据不全，保留在 buffer 中，等待下一次 read
-                        // std::cout << ">>> FD " << fd << " waiting for more data... (Current size: " << conn.in_buffer.size() << ")" << std::endl;
 
+                        // 2. 防御2：拒绝 Chunked 编码
+                        if (headers.find("Transfer-Encoding: chunked") != std::string::npos ||
+                            headers.find("Transfer-Encoding: Chunked") != std::string::npos) {
+                                std::cerr << ">>> [DoS Defense] Chunked not supported on FD " << fd << ". Sending 501..." <<std::endl;
+                                std::string resp = "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n";
+                                write(fd, resp.c_str(),  resp.size());
+                                goto close_connection;
+                        }
+
+                        // 3. 提取 Content-Length 
+                        int body_len = 0;
+                        std::size_t cl_pos = headers.find("Content-Length: ");
+                        if (cl_pos != std::string::npos) {
+                            std::size_t cl_end = headers.find("\r\n", cl_pos);
+                            if (cl_end != std::string::npos) {
+                                std::string cl_str = headers.substr(cl_pos + 16, cl_end - (cl_pos + 16));
+                                body_len = std::stoi(cl_str);
+                            }
+                        }
+
+                        // 4. 解决网络拆包问题
+                        if (conn.in_buffer.size() < (std::size_t)(header_total_len + body_len)) {
+                            break; // 剩余数据不完整，等待下一次 EPOLLIN 触发
+                        }
+
+                        // 5. 完整请求就绪，执行业务逻辑并回应响应
+                        std::string ok_resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                        write(fd, ok_resp.c_str(), ok_resp.size());
+
+                        // 6. 从 Buffer 中清理掉已处理的数据
+                        conn.in_buffer.erase(0, header_total_len + body_len);
                     }
 
                 } else if ( n == 0) {
-                    // 客户端正常关闭 
-                    std::cout << ">>> Client FD " << fd << "disconnected." << std::endl;
-                    close(fd);
-                    connections.erase(fd); // [Day 4 新增] 清理 Map
-                    // 【重要】从 Epoll 中移除该 fd (虽然进程退出会自动移除，但养成好习惯)
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    // 客户端断开连接
+                    goto close_connection;
+                    
                 } else {
-                    // 错误处理
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // 正常非阻塞返回
-                    } else {
-                        std::cerr << "Read error on FD " << fd << ", closing." << std::endl;
-                        close(fd);
-                        connections.erase(fd);
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-                    }
+                    // 非阻塞读到底或发生其他异常
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        // 发生真实错误时跳转
+                        goto close_connection;
+                    } 
                 }
+
+                // 本次读取或解析结束，进入下一轮事件处理
+                continue;
+
+                // ======================================
+                // [Day 5 新增] 统一资源清理出口
+                // ======================================
+                close_connection:
+                    std::cout << ">>> Closing FD: " << fd << std::endl;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
+                    connections.erase(fd);
             }
         }
     }
@@ -291,6 +321,4 @@ int main() {
     close (listen_fd);
     close (epoll_fd);
     return 0;
-
-    
 }
