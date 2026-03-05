@@ -38,10 +38,48 @@
 // 连接状态结构体
 struct Connection {
     std::string in_buffer; // 动态缓冲区，累积数据
+    // [Day 6 新增]: 输出缓冲区。所有要发给客户端的数据，必须先放进这里排队，决不允许直接 write
+    std::string out_buffer;
+    
+    // [Day 6 终极修复]: 必须把关闭状态绑定在连接对象上，防止异步写回期间局部变量丢失导致假死
+    bool is_closing;
+    Connection() : is_closing(false) {}
 };
 
 // 全局地图：fd -> Connection 对象
 std::unordered_map<int, Connection> connections;
+
+// =======================================================================
+// [Day 6 新增]: 业务处理与响应构造
+// =======================================================================
+void handle_request(int fd, Connection& conn) {
+    std::size_t line_end = conn.in_buffer.find("\r\n");
+    if (line_end == std::string::npos) return;
+
+    std::string request_line = conn.in_buffer.substr(0, line_end);
+    std::cout << ">>> [Request] FD " << fd << " Method: " << request_line << std::endl;
+
+    // [Day 6 核心改动]: 不再调用 write(), 而是把响应字符串无脑追加到out_buffer 中
+    std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    conn.out_buffer += resp;
+}
+
+// ========================================================================
+// [Day 6 新增]: 尽力而为写 (Best-Effort Write)
+// ========================================================================
+void write_best_effort(int fd, Connection& conn, bool& io_error) {
+    if (conn.out_buffer.empty()) return;
+
+    // [Day 6 终极修复]: 换用 send 并加 MSG_NOSIGNAL，防备客户端暴力断开引发 SIGPIPE 杀掉整个服务器
+    ssize_t w = send(fd, conn.out_buffer.c_str(), conn.out_buffer.size(), MSG_NOSIGNAL);
+    if (w > 0) {
+        // [Day 6 核心逻辑]: 发出去多少，就从 out_buffer 头部删掉多少。剩下的下次继续发
+        conn.out_buffer.erase(0, w);
+    } else if (w == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        // 如果不是 EAGAIN(缓冲区满) 导致的写入失败，说明连接出问题了
+        io_error = true;
+    }
+}
 
 int main() {
     // =========================================================================
@@ -216,92 +254,131 @@ int main() {
                 
                 // 1. 安全检查：确保 map 里有这个 fd
                 if (connections.find(fd) == connections.end()) {
-                    // 理论上不应该发生，除非并发竞争或逻辑错误
+                    // [Day 6 新增]: 补充清理和跳过逻辑，防崩溃
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                     continue;
                 }
                 
                 Connection& conn = connections[fd];
-                char temp_buf[4096];  // 临时栈缓冲，仅用于接收
+                bool io_error = false;
 
-                ssize_t n = read(fd, temp_buf, sizeof(temp_buf));
+                if (events[i].events & EPOLLIN) {
+                    char temp_buf[4096]; 
+                    ssize_t n = read(fd, temp_buf, sizeof(temp_buf));
 
-                if (n > 0) {
-                    // [Day 4 核心] 追加数据到动态 Buffer
-                    conn.in_buffer.append(temp_buf, n);
+                    if (n > 0) {
+                        // [Day 6 终极修复]: 如果已经判定该关了，就别再往里塞数据、走解析了，防止 431 循环触发
+                        if (!conn.is_closing) {
+                            // [Day 4 核心] 追加数据到动态 Buffer
+                            conn.in_buffer.append(temp_buf, n);
 
-                    // ========= [Day 5 新增: Dos 防御 1 (Header > 8KB)] =========
-                    // 【修正版逻辑】：
-                    // 如果一直没找到 \r\n\r\n 且堆积长度超过8KB，或者找到的 \r\n\r\n 位置本身就超过了8KB
-                    // 这两种情况都代表了 Header 字段过大，直接触发 431 并断开连接
-                    std::size_t pos = conn.in_buffer.find("\r\n\r\n");
-                    if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || 
-                        (pos != std::string::npos && pos > 8192)) {
-                        std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
-                        std::string resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
-                        write(fd, resp.c_str(), resp.size());
-                        goto close_connection;
-                    }
+                            // ========= [Day 5 新增: Dos 防御 1 (Header > 8KB)] =========
+                            // 【修正版逻辑】：
+                            // 如果一直没找到 \r\n\r\n 且堆积长度超过8KB，或者找到的 \r\n\r\n 位置本身就超过了8KB
+                            // 这两种情况都代表了 Header 字段过大，直接触发 431 并断开连接
+                            std::size_t pos = conn.in_buffer.find("\r\n\r\n");
+                            if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || 
+                                (pos != std::string::npos && pos > 8192)) {
+                                std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
+                                // [Day 6 修改]: 改为追加到 out_buffer，不再直接 write 并 goto
+                                std::string resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+                                conn.out_buffer += resp;
+                                conn.is_closing = true; // [Day 6 终极修复]: 使用类成员保存关闭状态
+                            } else {
+                                // [Day 6 修改]: 添加 else 块，触发 431 后不再执行协议解析
+                                // ====================================================
+                                // [Day 5 新增] HTTP 协议解析与边界校验
+                                // ====================================================
+                                while ((pos = conn.in_buffer.find("\r\n\r\n")) != std::string::npos) {
+                                    std::string headers = conn.in_buffer.substr(0, pos);
+                                    int header_total_len = pos + 4;
 
-                    // ====================================================
-                    // [Day 5 新增] HTTP 协议解析与边界校验
-                    // ====================================================
-                    while ((pos = conn.in_buffer.find("\r\n\r\n")) != std::string::npos) {
-                        std::string headers = conn.in_buffer.substr(0, pos);
-                        int header_total_len = pos + 4;
+                                    // 1. 解析 Request Line 
+                                    std::size_t line_end = headers.find("\r\n");
+                                    if (line_end != std::string::npos) {
+                                        std::string request_line = headers.substr(0, line_end);
+                                        std::cout << ">>> [Parse] FD " << fd << " Request: " << request_line << std::endl;
+                                    }
 
-                        // 1. 解析 Request Line 
-                        std::size_t line_end = headers.find("\r\n");
-                        if (line_end != std::string::npos) {
-                            std::string request_line = headers.substr(0, line_end);
-                            std::cout << ">>> [Parse] FD " << fd << " Request: " << request_line << std::endl;
-                        }
+                                    // 2. 防御2：拒绝 Chunked 编码
+                                    if (headers.find("Transfer-Encoding: chunked") != std::string::npos ||
+                                        headers.find("Transfer-Encoding: Chunked") != std::string::npos) {
+                                            std::cerr << ">>> [DoS Defense] Chunked not supported on FD " << fd << ". Sending 501..." <<std::endl;
+                                            // [Day 6 修改]: 改为追加到 out_buffer 并清理本段垃圾数据
+                                            std::string resp = "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n";
+                                            conn.out_buffer += resp;
+                                            conn.is_closing = true; // [Day 6 终极修复]: 存入状态
+                                            conn.in_buffer.erase(0, header_total_len);
+                                            break;
+                                    }
 
-                        // 2. 防御2：拒绝 Chunked 编码
-                        if (headers.find("Transfer-Encoding: chunked") != std::string::npos ||
-                            headers.find("Transfer-Encoding: Chunked") != std::string::npos) {
-                                std::cerr << ">>> [DoS Defense] Chunked not supported on FD " << fd << ". Sending 501..." <<std::endl;
-                                std::string resp = "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n";
-                                write(fd, resp.c_str(),  resp.size());
-                                goto close_connection;
-                        }
+                                    // 3. 提取 Content-Length 
+                                    int body_len = 0;
+                                    std::size_t cl_pos = headers.find("Content-Length: ");
+                                    if (cl_pos != std::string::npos) {
+                                        std::size_t cl_end = headers.find("\r\n", cl_pos);
+                                        if (cl_end != std::string::npos) {
+                                            std::string cl_str = headers.substr(cl_pos + 16, cl_end - (cl_pos + 16));
+                                            // [Day 6 修改]: 加 try-catch 防御恶意空数据或异常字符导致 stoi 崩溃
+                                            try { body_len = std::stoi(cl_str); } catch (...) { body_len = 0; }
+                                        }
+                                    }
 
-                        // 3. 提取 Content-Length 
-                        int body_len = 0;
-                        std::size_t cl_pos = headers.find("Content-Length: ");
-                        if (cl_pos != std::string::npos) {
-                            std::size_t cl_end = headers.find("\r\n", cl_pos);
-                            if (cl_end != std::string::npos) {
-                                std::string cl_str = headers.substr(cl_pos + 16, cl_end - (cl_pos + 16));
-                                body_len = std::stoi(cl_str);
+                                    // 4. 解决网络拆包问题
+                                    if (conn.in_buffer.size() < (std::size_t)(header_total_len + body_len)) {
+                                        break; // 剩余数据不完整，等待下一次 EPOLLIN 触发
+                                    }
+
+                                    // 5. 完整请求就绪，执行业务逻辑并回应响应
+                                    // [Day 6 修改]: 替换直接 write，交给 handle_request 生成响应放进 out_buffer
+                                    handle_request(fd, conn);
+                                    conn.is_closing = true; // [Day 6 终极修复]: 存入状态
+
+                                    // 6. 从 Buffer 中清理掉已处理的数据
+                                    conn.in_buffer.erase(0, header_total_len + body_len);
+
+                                    // [Day 6 新增]: 本次处理完成且已标记关闭连接，直接跳出不再处理后续数据
+                                    break;
+                                }
                             }
                         }
-
-                        // 4. 解决网络拆包问题
-                        if (conn.in_buffer.size() < (std::size_t)(header_total_len + body_len)) {
-                            break; // 剩余数据不完整，等待下一次 EPOLLIN 触发
-                        }
-
-                        // 5. 完整请求就绪，执行业务逻辑并回应响应
-                        std::string ok_resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-                        write(fd, ok_resp.c_str(), ok_resp.size());
-
-                        // 6. 从 Buffer 中清理掉已处理的数据
-                        conn.in_buffer.erase(0, header_total_len + body_len);
+                    } else if ( n == 0) {
+                        // 客户端断开连接
+                        // [Day 6 修改]: 只打关闭标记，不直接 goto
+                        conn.is_closing = true;
+                    } else {
+                        // 非阻塞读到底或发生其他异常
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            // 发生真实错误时
+                            // [Day 6 修改]: 只打错误标记，不直接 goto
+                            io_error = true;
+                        } 
                     }
+                } // [Day 6 修改] 闭合 EPOLLIN 的 if 块
 
-                } else if ( n == 0) {
-                    // 客户端断开连接
-                    goto close_connection;
-                    
-                } else {
-                    // 非阻塞读到底或发生其他异常
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        // 发生真实错误时跳转
-                        goto close_connection;
-                    } 
+                // [Day 6 新增]: 统一执行非阻塞尝试发送
+                if (!io_error) {
+                    write_best_effort(fd, conn, io_error);
                 }
+
+                // [Day 6 新增]: 统一的状态机判定出口
+                // 只有真出错，或业务需要关闭且数据全发完，才最终跳到关闭流程
+                if (io_error || (conn.is_closing && conn.out_buffer.empty())) {
+                    goto close_connection;
+                }
+
+                // [Day 6 新增]: 动态管理 Epoll 监听事件
+                struct epoll_event mod_event;
+                if (!conn.out_buffer.empty()) {
+                    // 数据没发完，注册 EPOLLOUT 让内核在可写时提醒我们
+                    mod_event.events = EPOLLIN | EPOLLOUT;
+                } else {
+                    // 数据发完，取消 EPOLLOUT 防止 CPU 空转
+                    mod_event.events = EPOLLIN;
+                }
+                mod_event.data.fd = fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &mod_event);
 
                 // 本次读取或解析结束，进入下一轮事件处理
                 continue;
