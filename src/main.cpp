@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <sstream>        // [Day 5 新增] 用于字符串串流解析，但我们暂用基础的 find 即可
 #include <deque>
+#include <cstdlib>
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -35,6 +36,16 @@
 // ===========================================================================
 static const int kMaxEvents = 128;
 static const int kMaxRequestsPerRound = 5;
+
+// ===========================================================================
+// 【Week2 Day2 新增】
+// ===========================================================================
+// 单轮读预算：最多读取 256KB
+static const size_t kMaxReadBytesPerEvent = 256 * 1024;
+
+// 单轮写预算：最多写出 256KB
+static const size_t kMaxWriteBytesPerEvent = 256 * 1024;
+
 // ============================================================================
 // 连接结构
 // ============================================================================
@@ -112,24 +123,41 @@ void handle_request(int fd, Connection& conn, const std::string& request_line) {
     
     conn.out_buffer += resp;
 
-    // 你当前 day6 的响应仍然是处理完就 close
+    // 你当前 MVP 的响应仍然是处理完就 close
     conn.is_closing = true;
 }
 
-// 尽力写回
-void write_best_effort(int fd, Connection& conn, bool& io_error) {
-    if (conn.out_buffer.empty()) return;
+// =============================【Week Day2 修改】=============================================
+// 改成"代写预算"的 best-effort write
+// 一次可写事件里，最多写 kMaxWriteBytesPerEvent
 
-    // [Day 6 终极修复]: 换用 send 并加 MSG_NOSIGNAL，防备客户端暴力断开引发 SIGPIPE 杀掉整个服务器
-    ssize_t w = send(fd, conn.out_buffer.c_str(), conn.out_buffer.size(), MSG_NOSIGNAL);
+void write_best_effort_with_budget(int fd, Connection& conn, bool& io_error) {
+    
+    ssize_t written_this_round = 0;
 
-    if (w > 0) {
-        // [Day 6 核心逻辑]: 发出去多少，就从 out_buffer 头部删掉多少。剩下的下次继续发
-        conn.out_buffer.erase(0, static_cast<size_t>(w));
-    } else if (w == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        // 如果不是 EAGAIN(缓冲区满) 导致的写入失败，说明连接出问题了
-        io_error = true;
+    while (!conn.out_buffer.empty() && written_this_round < kMaxWriteBytesPerEvent) {
+        size_t remain_budget = kMaxWriteBytesPerEvent - written_this_round;
+        size_t try_write = conn.out_buffer.size();
+
+        if (try_write > remain_budget) {
+            try_write = remain_budget;
+        }
+
+        ssize_t w = send(fd,
+                        conn.out_buffer.data(),
+                        try_write,
+                        MSG_NOSIGNAL);
+        if (w > 0) {
+            conn.out_buffer.erase(0, static_cast<size_t>(w));
+        } else if (w == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // 本轮先停，等下一次 EPOLLOUT
+            break;
+        } else {
+            io_error = true;
+            break;
+        }
     }
+    
 }
 
 // =============================================================================
@@ -207,6 +235,59 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
     update_epoll_events(epoll_fd, fd, conn);
 }
 
+// ==========================【Week Day2 新增】===============================
+// 带读预算的读取逻辑：一次 EPOLLIN 最多读 256KB
+void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
+    char temp_buf[4096];
+    size_t read_this_round = 0;
+
+    while (!conn.is_closing && read_this_round < kMaxReadBytesPerEvent) {
+        size_t remain_budget = kMaxReadBytesPerEvent - read_this_round;
+        size_t try_read = sizeof(temp_buf);
+
+        if (try_read > remain_budget) {
+            try_read = remain_budget;
+        }
+
+        ssize_t n = read(fd, temp_buf, try_read);
+
+        if (n > 0) {
+            conn.in_buffer.append(temp_buf, static_cast<size_t>(n));
+            read_this_round += static_cast<size_t>(n);
+
+            // Header 超过 8KB 的防御
+            std::size_t pos = conn.in_buffer.find("\r\n\r\n");
+            if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || (pos != std::string::npos && pos > 8192)) {
+                std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
+                conn.out_buffer +=
+                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+                conn.is_closing = true;
+                break; 
+            }
+
+            // 每次读进来后，尽量解析请求
+            process_requests_with_limit(epoll_fd, fd, conn);
+
+            // 如果业务已经决定关闭，就不用继续读了
+            if (conn.is_closing) {
+                break;
+            }
+        }else if (n == 0) {
+            // 对端关闭连接
+            conn.is_closing = true;
+            break;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 当前 socket 已经没数据了
+            break;
+        } else {
+            io_error = true;
+            break;
+        }
+    }
+}
+
 // =============================================================================
 // 主函数
 //
@@ -257,67 +338,38 @@ int main() {
     memset(&server_addr, 0, sizeof(server_addr));
     
     server_addr.sin_family = AF_INET;             // 指定协议族：IPv4 (必须与 socket() 一致)
-    
-    // 【WSL2 重点配置】：
-    // htonl: Host TO Network Long (主机字节序 转 网络字节序)
-    // INADDR_ANY: 是一个宏，值为 0.0.0.0
-    // 含义：绑定本机所有可用的网卡 IP。
-    // 好处：无论是通过 127.0.0.1 (本地)，还是 WSL2 的虚拟IP (如 172.x.x.x)，都能访问进来。
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY); 
-    
-    // htons: Host TO Network Short (主机字节序 转 网络字节序)
-    // 8080: 我们想要监听的端口号
-    // 【为什么转换？】：不同 CPU 存储数字的顺序不同 (大端/小端)，网络传输统一规定用“大端序”。
-    // 如果不转换，在 Intel CPU (小端) 上，8080 可能会被网络对面解析成另一个奇怪的端口。
-    server_addr.sin_port = htons(8080);              
-
-    // =========================================================================
-    // 第四步：绑定地址 (挂“招牌”)
-    // =========================================================================
-    // bind: 将 socket (listen_fd) 与具体的 IP 和端口 (server_addr) 绑定
-    // (struct sockaddr*): 强制类型转换。因为 bind 函数设计时为了兼容 IPv6 等其他协议，
-    //                     接收的是通用结构体 sockaddr*，而我们要传的是 IPv4 专用结构体 sockaddr_in*。
-    CHECK_RET(bind(listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)), "bind failed");
-
-    // =========================================================================
-    // 第五步：开始监听 (开门“营业”)
-    // =========================================================================
-    // listen: 将主动套接字转为被动套接字，开始等待客户端连接
-    // 参数 128: backlog (等待队列长度)
-    // 【核心原理】：当并发连接瞬间涌入，内核来不及让程序 accept 时，会把连接先排在这个队列里。
-    // 128 表示队列最多容纳 128 个等待中的连接，超过的直接拒绝。
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(8080);
+    CHECK_RET(bind(listen_fd, (struct sockaddr*)&server_addr,sizeof(server_addr)),"bind failed");
     CHECK_RET(listen(listen_fd, 128), "listen failed");
 
+    // 监听 socket 也设置成非阻塞 (更规范)
+    int listen_flags = fcntl(listen_fd, F_GETFL, 0);
+    fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK);
 
     std::cout << ">>> Server started! Switching to Epoll mode ..." << std::endl;
-
-    // ==========================================================================
-    // 2. 创建 Epoll 
-    // ==========================================================================
+    
+    // =========================================================
+    // 2. 创建 epoll
+    // =========================================================
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
-        std::cerr << "epoll_create1 failed" << std::endl;
+        std::cerr << "epoll_createl failed" << std::endl;
         return -1;
     }
 
-    // ------------------------------------------
-    // 2. 创建事件结构体，准备注册 listen_fd
-    // ------------------------------------------
     struct epoll_event event;
-    event.events = EPOLLIN;         // 我们关心“读”事件（有新连接也是读事件的一种）
-    event.data.fd = listen_fd;      // 把 listen_fd 绑定到这个事件上
+    event.events = EPOLLIN;
+    event.data.fd = listen_fd;
 
-    // ------------------------------------------
-    // 3. 将 listen_fd 添加到 Epoll 监听列表
-    // ------------------------------------------
-    // EPOLL_CTL_ADD: 添加操作
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
-        std::cerr << "epoll_ctl ADD failed" << std::endl;
-        return -1; 
+        std::cerr << "epoll_ctl ADD listen_fd failed" << std::endl;
+        return -1;
     }
+    std::cout << ">>> Epoll initiallized. Listening for events..." << std::endl;
+    
 
-    std::cout << ">>> Epoll initialized. Listening for events..." << std::endl;
-
+    
     // ==========================================================
     // 3. 事件循环 (Event Loop)
     // ==========================================================
@@ -340,45 +392,50 @@ int main() {
         // 遍历所有就绪的事件
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
-
+            // ------------------------------------------------------
+            // A. 新连接
+            // ------------------------------------------------------
             if (fd == listen_fd) {
-                // --------------------------------------
-                // 情况A: 新连接 (基本不变，仅增加 Map 初始化)
-                // --------------------------------------
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
+                while (true) {
+                    struct sockaddr_in client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+                    if (client_fd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK){
+                            break;
+                        }
+                        std::cerr << "accept failed" << std::endl;
+                        break;
+                    }
 
-                // 接受连接
-                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-                if (client_fd == -1) {
-                    std::cerr << "accept failed" << std::endl;
-                    continue;
+                    // 【关键】设置非阻塞(必须!)
+                    int flags = fcntl(client_fd, F_GETFL, 0);
+                    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+                    // 打印日志
+                    char client_ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                    std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
+
+                    // 【新增】将连接的 client_fd 也加入 Epoll 监听!
+                    // 这样下次它有数据时, epoll_wait 也会通知我们
+                    struct epoll_event client_event;
+                    client_event.events = EPOLLIN;  // 关心它的读事件
+                    client_event.data.fd = client_fd;
+
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                        std::cerr << "epoll_ctl ADD client failed" << std::endl;
+                        close (client_fd);
+                        continue;
+                    } 
+
+                    connections[client_fd] = Connection();
+                
+
                 }
 
-                // 【关键】设置非阻塞(必须!)
-                int flags = fcntl(client_fd, F_GETFL, 0);
-                fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-                // 打印日志
-                char client_ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-                std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
-
-                // 【新增】将连接的 client_fd 也加入 Epoll 监听!
-                // 这样下次它有数据时, epoll_wait 也会通知我们
-                struct epoll_event client_event;
-                client_event.events = EPOLLIN;  // 关心它的读事件
-                client_event.data.fd = client_fd;
-
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
-                    std::cerr << "epoll_ctl ADD client failed" << std::endl;
-                    close (client_fd);
-                    continue;
-                } 
-
-                connections[client_fd] = Connection();
                 continue;
-
+                
             } 
             // --------------------------------------------------
             // 情况 B: 客户端数据达到 (Day 4 彻底重写)
@@ -394,100 +451,66 @@ int main() {
                 
             Connection& conn = it ->second;
             bool io_error = false;
-
-            // 可读事件
+            // ===================【Week2 Day2 修改】====================
+            // 可读事件: 改成"带预算循环读"
             if (events[i].events & EPOLLIN) {
-                char temp_buf[4096]; 
-                ssize_t n = read(fd, temp_buf, sizeof(temp_buf));
-
-                if (n > 0) {
-                    // [Day 6 终极修复]: 如果已经判定该关了，就别再往里塞数据、走解析了，防止 431 循环触发
-                    if (!conn.is_closing) {
-                        // [Day 4 核心] 追加数据到动态 Buffer
-                        conn.in_buffer.append(temp_buf, n);
-
-                        // ========= [Day 5 新增: Dos 防御 1 (Header > 8KB)] =========
-                        // 【修正版逻辑】：
-                        // 如果一直没找到 \r\n\r\n 且堆积长度超过8KB，或者找到的 \r\n\r\n 位置本身就超过了8KB
-                        // 这两种情况都代表了 Header 字段过大，直接触发 431 并断开连接
-                        // Header 超过 8KB 防御
-                        std::size_t pos = conn.in_buffer.find("\r\n\r\n");
-                        if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || 
-                            (pos != std::string::npos && pos > 8192)) {
-                            std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
-                            
-                            conn.out_buffer +=
-                                "HTTP/1.1 431 Request Header Fields Too Large\r\n"
-                                "Connection: close\r\n"
-                                "\r\n";
-                            conn.is_closing = true;
-                            update_epoll_events(epoll_fd, fd, conn);
-                            
-                        } else {
-                            process_requests_with_limit(epoll_fd, fd, conn);   
-                                
-                            }
-                        }
-                        
-                    } else if ( n == 0) {
-                        conn.is_closing = true;
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        io_error =true;
-                    }
-                } 
-                // 可写事件
-                if (!io_error && (events[i].events & EPOLLOUT)) {
-                    write_best_effort(fd, conn, io_error);
-                    update_epoll_events(epoll_fd, fd, conn);
-                }
-
-                // 收尾关闭
-                if (io_error || (conn.is_closing && conn.out_buffer.empty())){
-                    close_connection(epoll_fd, fd);
-                }     
-            
+                read_with_budget(epoll_fd, fd, conn, io_error);
             }
-            // -------------------------------------------------------------
-            // C. Week2 Day1 核心: 主动消费 ReadyQueue
-            // 这一轮 epoll 事件处理完后，继续处理"已有完整请求但被预算打断"的连接
-            // -------------------------------------------------------------
+            // 可写事件
+            if (!io_error && (events[i].events & EPOLLOUT)) {
+                write_best_effort_with_budget(fd, conn, io_error);
+                update_epoll_events(epoll_fd, fd, conn);
+            }
 
-            size_t round_count = ready_queue.size();
-            while (round_count--> 0 && !ready_queue.empty()) {
-                int fd = ready_queue.front();
-                ready_queue.pop_front();
+            // 收尾关闭
+            if (io_error || (conn.is_closing && conn.out_buffer.empty())){
+                close_connection(epoll_fd, fd);
+            }     
+            
+        }
+        // -------------------------------------------------------------
+        // C. Week2 Day1 核心: 主动消费 ReadyQueue
+        // 这一轮 epoll 事件处理完后，继续处理"已有完整请求但被预算打断"的连接
+        // -------------------------------------------------------------
 
-                auto it = connections.find(fd);
-                if (it == connections.end()) {
-                    continue;
-                }
+        size_t round_count = ready_queue.size();
+        while (round_count--> 0 && !ready_queue.empty()) {
+            int fd = ready_queue.front();
+            ready_queue.pop_front();
 
-                Connection& conn = it->second;
-                conn.in_ready_queue = false;
+            auto it = connections.find(fd);
+            if (it == connections.end()) {
+                continue;
+            }
 
-                if (conn.is_closing) {
-                    if (conn.out_buffer.empty()) {
-                        close_connection(epoll_fd, fd);
-                    }
-                    continue;
+            Connection& conn = it->second;
+            conn.in_ready_queue = false;
 
-                }
-
-                process_requests_with_limit(epoll_fd, fd, conn);
-
-                bool io_error = false;
-                if (!conn.out_buffer.empty()) {
-                    write_best_effort(fd, conn, io_error);
-                    update_epoll_events(epoll_fd, fd, conn);
-                }
-
-                if (io_error || (conn.is_closing && conn.out_buffer.empty())) {
+            if (conn.is_closing) {
+                if (conn.out_buffer.empty()) {
                     close_connection(epoll_fd, fd);
                 }
+                continue;
+
+            }
+
+            process_requests_with_limit(epoll_fd, fd, conn);
+
+            bool io_error = false;
+            if (!conn.out_buffer.empty()) {
+                // ================【week2 Day2 修改】=======================
+                // Readyqueue 后续写回，也要受单轮写预算限制
+                write_best_effort_with_budget(fd, conn, io_error);
+                update_epoll_events(epoll_fd, fd, conn);
+            }
+
+            if (io_error || (conn.is_closing && conn.out_buffer.empty())) {
+                close_connection(epoll_fd, fd);
             }
         }
+    }
 
-        close (listen_fd);
-        close (epoll_fd);
-        return 0;
+    close (listen_fd);
+    close (epoll_fd);
+    return 0;
 }
