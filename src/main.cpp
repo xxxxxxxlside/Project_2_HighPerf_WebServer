@@ -19,6 +19,9 @@
 #include <sstream>        // [Day 5 新增] 用于字符串串流解析，但我们暂用基础的 find 即可
 #include <deque>
 #include <cstdlib>
+#include <vector>       // =====================【Week2 Day3 新增】=====================
+// 用于从 ReadyQueue 中移除 fd. 以及统一处理 pending_close_queue
+
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -59,7 +62,11 @@ struct Connection {
     // [Day 6 终极修复]: 必须把关闭状态绑定在连接对象上，防止异步写回期间局部变量丢失导致假死
     bool is_closing;
     bool in_ready_queue;
-    Connection() : is_closing(false), in_ready_queue(false) {}
+    // ===================【Week2 Day3 新增】 ================
+    // 标记这个 fd 是否已经做过 close(fd)
+    // 防止重复 close
+    bool fd_closed;
+    Connection() : is_closing(false), in_ready_queue(false), fd_closed(false) {}
 };
 
 // 全局地图：fd -> Connection 对象
@@ -67,6 +74,10 @@ std::unordered_map<int, Connection> connections;
 
 // ReadyQueue: 存“还有完整请求没处理完，但这轮预算已用完”的 fd
 std::deque<int> ready_queue; 
+
+// =====================【Week2 Day3 新增】======================================
+// 延迟释放队列：本轮里只登记，等本轮末尾再统一 erase
+std::vector<int> pending_close_queue;
 
 // ============================================================================
 // 工具函数
@@ -79,6 +90,12 @@ bool has_complete_request(const Connection& conn) {
 
 // 更新 epoll 里这个 fd 关心的事件
 void update_epoll_events(int epoll_fd, int fd, const Connection& conn) {
+    // =====================【Week2 Day3 新增】======================================
+    // 只有 fd 真正关闭后，才不再修改 epoll 事件
+    if (conn.fd_closed) {
+        return;
+    }
+    
     struct epoll_event ev;
     ev.data.fd = fd;
     ev.events = EPOLLIN;
@@ -92,17 +109,72 @@ void update_epoll_events(int epoll_fd, int fd, const Connection& conn) {
         std::cerr << "epoll_ctl MOD failed for fd =" << fd << " errno=" << errno << std::endl;
     }
 }
+// =====================【Week2 Day3 新增】======================================
+// 从 ReadyQueue 中摘掉指定 fd
+void remove_from_ready_queue(int fd, Connection& conn) {
+    if (!conn.in_ready_queue) {
+        return;
+    }
 
-// 关闭连接并清理
-void close_connection(int epoll_fd, int fd) {
-    std::cout << ">>> Closing FD: " << fd << std::endl;
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
-    connections.erase(fd);
+    std::deque<int> new_queue;
+    while(!ready_queue.empty()) {
+        int cur = ready_queue.front();
+        ready_queue.pop_front();
+        if (cur != fd) {
+            new_queue.push_back(cur);
+        }
+    }
+    ready_queue.swap(new_queue);
+    conn.in_ready_queue = false;
 }
+
+// =====================【Week2 Day3 新增】======================================
+// 唯一关闭入口：只负责“发起关闭”
+// 流程：closing-true -> 从 ReadyQueue 摘除 -> epoll DEL -> close(fd)
+// -> 标记 fd_closed -> 放入 pending_close_queue 等待本轮末尾统一 erase
+void request_close(int epoll_fd, int fd, Connection& conn) {
+    if (conn.is_closing && conn.fd_closed) {
+        return;
+    }
+
+    if (!conn.is_closing) {
+        conn.is_closing = true;
+    }
+
+    remove_from_ready_queue(fd, conn);
+
+    if (!conn.fd_closed) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
+        conn.fd_closed = true;
+        pending_close_queue.push_back(fd);
+
+        std::cout << ">>> [Close Requested] FD: " << fd << std::endl;
+    }
+}
+
+// =====================【Week2 Day3 新增】======================================
+// 本轮末尾统一真正释放 connection 对象
+void flush_pending_close_queue() {
+    for (int fd : pending_close_queue) {
+        auto it = connections.find(fd);
+        if (it != connections.end()) {
+            std::cout << ">>> [Final Release] FD: " << fd << std::endl;
+            connections.erase(it);
+        }
+    }
+    pending_close_queue.clear();
+}
+
 
 // 入队 ReadyQueue (防止重复入队)
 void enqueue_ready(int fd, Connection& conn) {
+    // =====================【Week2 Day3 新增】======================================
+    // closing 状态下不再入队
+    if (conn.is_closing || conn.fd_closed) {
+        return;
+    }
+    
     if (!conn.in_ready_queue) {
         ready_queue.push_back(fd);
         conn.in_ready_queue = true;
@@ -149,6 +221,9 @@ void write_best_effort_with_budget(int fd, Connection& conn, bool& io_error) {
                         MSG_NOSIGNAL);
         if (w > 0) {
             conn.out_buffer.erase(0, static_cast<size_t>(w));
+            // =====================【Week2 Day3 修改】======================================
+            // Day2 漏了 written_this_round 的累加，这里补上
+            written_this_round += static_cast<size_t>(w);
         } else if (w == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // 本轮先停，等下一次 EPOLLOUT
             break;
@@ -342,10 +417,9 @@ int main() {
     server_addr.sin_port = htons(8080);
     CHECK_RET(bind(listen_fd, (struct sockaddr*)&server_addr,sizeof(server_addr)),"bind failed");
     CHECK_RET(listen(listen_fd, 128), "listen failed");
-
-    // 监听 socket 也设置成非阻塞 (更规范)
-    int listen_flags = fcntl(listen_fd, F_GETFL, 0);
-    fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK);
+    // =====================【Week2 Day3 修改】======================================
+    // 这里保持你 day2 当前已经跑通的做法：
+    // 不改 listen_fd 的非阻塞逻辑，避免再引入新的变量
 
     std::cout << ">>> Server started! Switching to Epoll mode ..." << std::endl;
     
@@ -396,44 +470,38 @@ int main() {
             // A. 新连接
             // ------------------------------------------------------
             if (fd == listen_fd) {
-                while (true) {
-                    struct sockaddr_in client_addr;
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-                    if (client_fd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK){
-                            break;
-                        }
-                        std::cerr << "accept failed" << std::endl;
-                        break;
-                    }
-
-                    // 【关键】设置非阻塞(必须!)
-                    int flags = fcntl(client_fd, F_GETFL, 0);
-                    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-                    // 打印日志
-                    char client_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-                    std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
-
-                    // 【新增】将连接的 client_fd 也加入 Epoll 监听!
-                    // 这样下次它有数据时, epoll_wait 也会通知我们
-                    struct epoll_event client_event;
-                    client_event.events = EPOLLIN;  // 关心它的读事件
-                    client_event.data.fd = client_fd;
-
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
-                        std::cerr << "epoll_ctl ADD client failed" << std::endl;
-                        close (client_fd);
-                        continue;
-                    } 
-
-                    connections[client_fd] = Connection();
-                
-
+                // =====================【Week2 Day3 新增】======================================
+                // 保持你 day2 当前跑通的 accept 风格，不去额外改动这一块
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+                if (client_fd == -1) {
+                    std::cerr << "accept failed" << std::endl;
+                    continue;;
                 }
 
+                // 【关键】设置非阻塞(必须!)
+                int flags = fcntl(client_fd, F_GETFL, 0);
+                fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+                // 打印日志
+                char client_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
+
+                // 【新增】将连接的 client_fd 也加入 Epoll 监听!
+                // 这样下次它有数据时, epoll_wait 也会通知我们
+                struct epoll_event client_event;
+                client_event.events = EPOLLIN;  // 关心它的读事件
+                client_event.data.fd = client_fd;
+
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                    std::cerr << "epoll_ctl ADD client failed" << std::endl;
+                    close (client_fd);
+                    continue;
+                } 
+
+                connections[client_fd] = Connection();
                 continue;
                 
             } 
@@ -461,10 +529,11 @@ int main() {
                 write_best_effort_with_budget(fd, conn, io_error);
                 update_epoll_events(epoll_fd, fd, conn);
             }
-
-            // 收尾关闭
+            // =====================【Week2 Day3 修改】======================================
+            // 不再直接 close_connection
+            // 改成统一走 request_close
             if (io_error || (conn.is_closing && conn.out_buffer.empty())){
-                close_connection(epoll_fd, fd);
+                request_close(epoll_fd, fd, conn);
             }     
             
         }
@@ -484,11 +553,15 @@ int main() {
             }
 
             Connection& conn = it->second;
-            conn.in_ready_queue = false;
 
-            if (conn.is_closing) {
-                if (conn.out_buffer.empty()) {
-                    close_connection(epoll_fd, fd);
+            // =====================【Week2 Day3 修改】======================================
+            // 出队后先清标记
+            conn.in_ready_queue = false;
+            // =====================【Week2 Day3 新增】======================================
+            // 如果已经进入关闭态或 fd 已关闭，跳过
+            if (conn.is_closing || conn.fd_closed) {
+                if (conn.is_closing && conn.out_buffer.empty()) {
+                    request_close(epoll_fd, fd, conn);
                 }
                 continue;
 
@@ -503,11 +576,15 @@ int main() {
                 write_best_effort_with_budget(fd, conn, io_error);
                 update_epoll_events(epoll_fd, fd, conn);
             }
-
+            // =====================【Week2 Day3 修改】======================================
             if (io_error || (conn.is_closing && conn.out_buffer.empty())) {
-                close_connection(epoll_fd, fd);
+                request_close(epoll_fd, fd, conn);
             }
         }
+
+        // =====================【Week2 Day3 新增】======================================
+        // 本轮事件循环最后，统一真正释放连接对象
+        flush_pending_close_queue();
     }
 
     close (listen_fd);
