@@ -49,6 +49,13 @@ static const size_t kMaxReadBytesPerEvent = 256 * 1024;
 // 单轮写预算：最多写出 256KB
 static const size_t kMaxWriteBytesPerEvent = 256 * 1024;
 
+// =====================【Week2 Day4 新增】======================================
+// 全局 inflight 内存上限: 512MB
+static const size_t kMaxInflightBytes = 512 * 1024 *1024;
+
+// 单请求 body 上限: 8MB
+static const int kMaxBodyBytes = 8 * 1024 * 1024;
+
 // ============================================================================
 // 连接结构
 // ============================================================================
@@ -79,6 +86,10 @@ std::deque<int> ready_queue;
 // 延迟释放队列：本轮里只登记，等本轮末尾再统一 erase
 std::vector<int> pending_close_queue;
 
+// =====================【Week2 Day4 新增】======================================
+// 全局 inflight 字节计数器
+size_t global_inflight_bytes = 0;
+
 // ============================================================================
 // 工具函数
 // ============================================================================
@@ -86,6 +97,61 @@ std::vector<int> pending_close_queue;
 // 判断 in_buffer 里是否至少有一个完整 HTTP 请求头
 bool has_complete_request(const Connection& conn) {
     return conn.in_buffer.find("\r\n\r\n") != std::string::npos;
+}
+
+// =====================【Week2 Day4 新增】======================================
+// 统一追加到 in_buffer, 并维护 global_inflight_bytes
+bool append_to_in_buffer(Connection& conn, const char* data, size_t len) {
+    if (global_inflight_bytes + len > kMaxInflightBytes) {
+        return false;
+    }
+
+    conn.in_buffer.append(data, len);
+    global_inflight_bytes += len;
+    return true;
+}
+
+// =====================【Week2 Day4 新增】======================================
+// 统一追加到 out_buffer, 并维护 global_inflight_bytes
+bool append_to_out_buffer(Connection& conn, const std::string& data) {
+    if (global_inflight_bytes + data.size() > kMaxInflightBytes) {
+        return false;
+    }
+
+    conn.out_buffer += data;
+    global_inflight_bytes += data.size();
+    return true;
+}
+
+// =====================【Week2 Day4 新增】======================================
+// 从 in_buffer 删除前缀，并维护 global_inflight_bytes
+void erase_from_in_buffer_prefix(Connection& conn, size_t len) {
+    if (len > conn.in_buffer.size()) {
+        len = conn.in_buffer.size();
+    }
+
+    conn.in_buffer.erase(0, len);
+    global_inflight_bytes -= len;
+}
+
+// =====================【Week2 Day4 新增】======================================
+// 从 out_buffer 删除前缀，并维护 global_inflight_bytes
+void erase_from_out_buffer_prefix(Connection& conn, size_t len) {
+    if (len > conn.out_buffer.size()) {
+        len = conn.out_buffer.size();
+    }
+
+    conn.out_buffer.erase(0, len);
+    global_inflight_bytes -= len;
+}
+
+// =====================【Week2 Day4 新增】======================================
+// 释放某个连续剩余 buffer 占用的 inflight 计数
+void release_connection_buffers(Connection& conn) {
+    global_inflight_bytes -= conn.in_buffer.size();
+    global_inflight_bytes -= conn.out_buffer.size();
+    conn.in_buffer.clear();
+    conn.out_buffer.clear();
 }
 
 // 更新 epoll 里这个 fd 关心的事件
@@ -160,6 +226,11 @@ void flush_pending_close_queue() {
         auto it = connections.find(fd);
         if (it != connections.end()) {
             std::cout << ">>> [Final Release] FD: " << fd << std::endl;
+
+            // =====================【Week2 Day4 新增】======================================
+            // 真正 erase 前，把这个连接还占着的 buffer 字节数扣掉
+            release_connection_buffers(it->second);
+
             connections.erase(it);
         }
     }
@@ -193,9 +264,21 @@ void handle_request(int fd, Connection& conn, const std::string& request_line) {
         "\r\n"
         "OK";
     
-    conn.out_buffer += resp;
+    // =====================【Week2 Day4 新增】======================================
+    // 不再直接 out_buffer += resp
+    // 改成统一走 append_to_out_buffer,顺带做 inflight budget 检查
+    if (!append_to_out_buffer(conn, resp)) {
+        std::cerr << ">>> [Inflight Budget] Response append exceeds limit." << "Sending 503..." << std::endl;
+        conn.out_buffer.clear(); // 这里 clear 不需要扣计数，因为 append 失败根本没加进去
 
-    // 你当前 MVP 的响应仍然是处理完就 close
+        std::string err_resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Connection: Close\r\n"
+            "\r\n";
+        append_to_out_buffer(conn, err_resp);
+    }
+
+    
     conn.is_closing = true;
 }
 
@@ -220,9 +303,10 @@ void write_best_effort_with_budget(int fd, Connection& conn, bool& io_error) {
                         try_write,
                         MSG_NOSIGNAL);
         if (w > 0) {
-            conn.out_buffer.erase(0, static_cast<size_t>(w));
-            // =====================【Week2 Day3 修改】======================================
-            // Day2 漏了 written_this_round 的累加，这里补上
+            // =====================【Week2 Day4 修改】======================================
+            // 不再直接 erase. 改成统一扣减 inflight 计数
+            erase_from_out_buffer_prefix(conn, static_cast<size_t>(w));
+
             written_this_round += static_cast<size_t>(w);
         } else if (w == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // 本轮先停，等下一次 EPOLLOUT
@@ -264,10 +348,13 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
         if (headers.find("Transfer-Encoding: chunked") != std::string::npos || headers.find("Transfer-encoding: Chunked") != std::string::npos) {
             std::cerr << ">>> [DoS Defense] Chunked not supported on FD " << fd << ". Sending 501..." << std::endl;
 
-            conn.out_buffer +=
+            // =====================【Week2 Day4 修改】======================================
+            std::string err_resp = 
                 "HTTP/1.1 501 Not Implemented\r\n"
                 "Connection: close\r\n"
                 "\r\n";
+            append_to_out_buffer(conn, err_resp);
+            // =============================================
             conn.is_closing = true;
             break;
         
@@ -287,6 +374,19 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
             content_length = std::atoi(value_str.c_str());
         }
 
+        // =====================【Week2 Day4 新增】==============================
+        // Body 大小限制: > 8MB 直接 413 + close
+        if (content_length > kMaxBodyBytes) {
+            std::cerr << ">>> [Body Limit] Content-Length too large on Fd" << fd << ". Sending 413..." << std::endl;
+            std::string err_resp = 
+                "HTTP/1.1 413 Payload Too Large\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            append_to_out_buffer(conn, err_resp);
+            conn.is_closing = true;
+            break;
+        }
+        // =====================================================
         // 4. 检查整个请求是否收全 (header + body)
         if (static_cast<int>(conn.in_buffer.size()) < header_total_len + content_length) {
             break;
@@ -295,9 +395,10 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
         // 5. 完整请求到齐，交给业务处理
         handle_request(fd,conn, request_line);
 
-        // 6. 从 in_buffer 移除一个完整请求
-        conn.in_buffer.erase(0, static_cast<size_t>(header_total_len + content_length));
-
+        // =====================【Week2 Day4 修改】==============================
+        // 不再直接 erase in_buffer, 改成统一扣减 inflight 计数
+        erase_from_in_buffer_prefix(conn, static_cast<size_t>(header_total_len + content_length));
+        // ==========================================================
         ++processed;
     }
 
@@ -327,17 +428,36 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
         ssize_t n = read(fd, temp_buf, try_read);
 
         if (n > 0) {
-            conn.in_buffer.append(temp_buf, static_cast<size_t>(n));
+            // =====================【Week2 Day4 修改】==============================
+            // 不再直接 append 到 in_buffer
+            // 改正统一做 inflight budget 检查
+            if (!append_to_in_buffer(conn, temp_buf, static_cast<size_t>(n))) {
+                std::cerr << ">>> [Inflight Budget] In-buffer append exceeds limit on FD " << fd << ". Sending 503..." << std::endl;
+                std::string err_resp =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+                append_to_out_buffer(conn, err_resp);
+                conn.is_closing = true;
+                break;
+            }
+            // ================================================
+
+            
+            
             read_this_round += static_cast<size_t>(n);
 
             // Header 超过 8KB 的防御
             std::size_t pos = conn.in_buffer.find("\r\n\r\n");
             if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || (pos != std::string::npos && pos > 8192)) {
                 std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
-                conn.out_buffer +=
+                // =====================【Week2 Day4 修改】==============================
+                std::string err_resp=
                     "HTTP/1.1 431 Request Header Fields Too Large\r\n"
                     "Connection: close\r\n"
                     "\r\n";
+                append_to_out_buffer(conn, err_resp);
+                // =====================================================
                 conn.is_closing = true;
                 break; 
             }
