@@ -21,7 +21,10 @@
 #include <cstdlib>
 #include <vector>       // =====================【Week2 Day3 新增】=====================
 // 用于从 ReadyQueue 中移除 fd. 以及统一处理 pending_close_queue
-
+// ======= [Week2 Day5 新增开始: 头文件] ================
+#include <list>         // LRU 链表
+#include <chrono>       // Token Bucket 时间计算
+// ======= [Week2 Day5 新增结束: 头文件] ========================
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -56,6 +59,15 @@ static const size_t kMaxInflightBytes = 512 * 1024 *1024;
 // 单请求 body 上限: 8MB
 static const int kMaxBodyBytes = 8 * 1024 * 1024;
 
+// ======= [Week2 Day5 新增开始: IP限流常量] ================
+static const size_t kIpBucketMaxEntries = 100000;       // [Day5新增] 最多记录 10 万个 IP
+static const int kIpBucketTtlSeconds = 600;             // [Day5新增] 10 分钟没访问就过期
+static const double kIpBucketCapcity = 200.0;           // [Day5新增] 桶容量 200
+static const double kIpBucketRefillPerSec = 50.0;       // [Day5新增] 每秒补充 50 个 token
+// 本地测试时可临时改成：
+// static const double kIpBucketCapacity = 20.0;
+// static const double kIpBucketRefillPerSec = 1.0;
+// ======= [Week2 Day5 新增结束: IP限流常量] ================
 // ============================================================================
 // 连接结构
 // ============================================================================
@@ -89,6 +101,18 @@ std::vector<int> pending_close_queue;
 // =====================【Week2 Day4 新增】======================================
 // 全局 inflight 字节计数器
 size_t global_inflight_bytes = 0;
+
+// ======= [Week2 Day5 新增开始: IP桶结构和全局变量] ================
+struct IpBucket {
+    double tokens;      // [Day5新增] 当前剩余 token
+    std::chrono::steady_clock::time_point last_refill; // [Day5新增] 上次补充时间
+    std::chrono::steady_clock::time_point last_seen;   // [Day5新增] 上次访问时间
+    std::list<std::string>::iterator lru_it;           // [Day5新增] 在 LRU 链表中的位置
+};
+
+std::unordered_map<std::string, IpBucket> ip_buckets;  // [Day5新增] IP -> Bucket
+std::list<std::string> ip_lru;                         // [Day5新增] LRU 链表：头新尾旧
+// ======= [Week2 Day5 新增结束: IP桶结构和全局变量] ================
 
 // ============================================================================
 // 工具函数
@@ -251,6 +275,122 @@ void enqueue_ready(int fd, Connection& conn) {
         conn.in_ready_queue = true;
     }
 }
+
+// ======= [Week2 Day5 新增开始: 更新LRU位置] ================
+void touch_ip_bucket_lru(const std::string& ip) {
+    auto it = ip_buckets.find(ip);
+    if (it == ip_buckets.end()) {
+        return;
+    }
+
+    ip_lru.erase(it->second.lru_it);
+    ip_lru.push_front(ip);
+    it->second.lru_it = ip_lru.begin();
+}
+// ======= [Week2 Day5 新增结束: 更新LRU位置] ================
+
+// ======= [Week2 Day5 新增开始: 清理过期IP桶] ================
+void cleanup_expired_ip_buckets() {
+    auto now = std::chrono::steady_clock::now();
+
+    while (!ip_lru.empty()) {
+        const std::string& oldest_ip = ip_lru.back();
+        auto it = ip_buckets.find(oldest_ip);
+        if (it == ip_buckets.end()) {
+            ip_lru.pop_back();
+            continue;
+        }
+
+        auto idle_sec = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_seen).count();
+        if (idle_sec < kIpBucketTtlSeconds) {
+            break;
+        }
+
+        ip_lru.pop_back();
+        ip_buckets.erase(it);
+    }
+}
+// ======= [Week2 Day5 新增结束: 清理过期IP桶] ================
+
+// ======= [Week2 Day5 新增开始: LRU淘汰超限IP] ================
+void evict_ip_buckets_if_needed() {
+    while (ip_buckets.size() > kIpBucketMaxEntries && !ip_lru.empty()) {
+        std::string oldest_ip = ip_lru.back();
+        ip_lru.pop_back();
+        ip_buckets.erase(oldest_ip);
+    }
+}
+// ======= [Week2 Day5 新增结束: LRU淘汰超限IP] ================
+
+// ======= [Week2 Day5 新增开始: 补充token] ================
+void refill_ip_bucket(IpBucket& bucket, const std::chrono::steady_clock::time_point& now) {
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - bucket.last_refill).count();
+
+    if (elapsed_ms <= 0) {
+        return;
+    }
+
+    double add_tokens = (elapsed_ms / 1000.0) * kIpBucketRefillPerSec;
+    bucket.tokens += add_tokens;
+    if (bucket.tokens > kIpBucketCapcity) {
+        bucket.tokens = kIpBucketCapcity;
+    }
+
+    bucket.last_refill = now;
+}
+// ======= [Week2 Day5 新增结束: 补充token] ================
+
+// ======= [Week2 Day5 新增开始: 消耗token并判断是否放行] ================
+bool consume_ip_token(const std::string& ip) {
+    cleanup_expired_ip_buckets();
+
+    auto now = std::chrono::steady_clock::now();
+    auto it = ip_buckets.find(ip);
+
+    // 第一次看到这个 IP: 创建一个满桶
+    if (it == ip_buckets.end()) {
+        ip_lru.push_front(ip);
+
+        IpBucket bucket;
+        bucket.tokens = kIpBucketCapcity;
+        bucket.last_refill = now;
+        bucket.last_seen = now;
+        bucket.lru_it = ip_lru.begin();
+
+        auto ret = ip_buckets.emplace(ip, bucket);
+        it = ret.first;
+
+        evict_ip_buckets_if_needed();
+    }
+
+    IpBucket& bucket = it->second;
+    refill_ip_bucket(bucket, now);
+    bucket.last_seen = now;
+    touch_ip_bucket_lru(ip);
+
+    if (bucket.tokens < 1.0) {
+        return false;
+    }
+
+    bucket.tokens -= 1.0;
+    return true;
+}
+// ======= [Week2 Day5 新增结束: 消耗token并判断是否放行] ================
+
+// ======= [Week2 Day5 新增开始: 429拒绝函数] ================
+void reject_new_connection_with_429(int fd) {
+    const char* resp =
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Length: 17\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Too Many Requests";
+
+    send(fd, resp, std::strlen(resp), MSG_NOSIGNAL);
+    close(fd);
+}
+// ======= [Week2 Day5 新增结束: 429拒绝函数] ================
+
 
 // 业务处理:构造响应
 void handle_request(int fd, Connection& conn, const std::string& request_line) {
@@ -537,9 +677,13 @@ int main() {
     server_addr.sin_port = htons(8080);
     CHECK_RET(bind(listen_fd, (struct sockaddr*)&server_addr,sizeof(server_addr)),"bind failed");
     CHECK_RET(listen(listen_fd, 128), "listen failed");
-    // =====================【Week2 Day3 修改】======================================
-    // 这里保持你 day2 当前已经跑通的做法：
-    // 不改 listen_fd 的非阻塞逻辑，避免再引入新的变量
+    // ======= [Week2 Day5 必要修复开始: listen_fd 非阻塞] ================
+    // 现在 accept 分支已经改成 while(true) 循环 accept
+    // 如果 listen_fd 仍然是阻塞的，那么队列取空后下一次 accept 会直接卡住
+    int listen_flags = fcntl(listen_fd, F_GETFL, 0);
+    CHECK_RET(listen_flags, "fcntl(F_GETFL) on listen_fd failed");
+    CHECK_RET(fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK), "fcntl(F_SETFL) on listen_fd failed");
+    // ======= [Week2 Day5 必要修复结束: listen_fd 非阻塞] ================
 
     std::cout << ">>> Server started! Switching to Epoll mode ..." << std::endl;
     
@@ -590,38 +734,62 @@ int main() {
             // A. 新连接
             // ------------------------------------------------------
             if (fd == listen_fd) {
-                // =====================【Week2 Day3 新增】======================================
-                // 保持你 day2 当前跑通的 accept 风格，不去额外改动这一块
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-                if (client_fd == -1) {
-                    std::cerr << "accept failed" << std::endl;
-                    continue;;
+                // ===== [Week2 Day5 修改开始：accept后增加IP限流] =====
+                while(true) {
+                    struct sockaddr_in client_addr;
+                    std::memset(&client_addr, 0, sizeof(client_addr));
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+                    if (client_fd == -1) {
+                        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        std::cerr << "accept failed, errno=" << errno << std::endl;
+                        break;
+                    }
+
+                    char client_ip[INET_ADDRSTRLEN] = {0}; // [Day5新增]
+                    const char* ip_cstr = inet_ntop(
+                        AF_INET,
+                        &client_addr.sin_addr,
+                        client_ip,
+                        INET_ADDRSTRLEN
+                    );
+                    std::string client_ip_str = ip_cstr ? client_ip : "unknown"; // [Day5新增]
+                    // [Day5新增]
+                    if (!consume_ip_token(client_ip_str)) {
+                        std::cout << ">>> [429 Reject] ip=" << client_ip_str << std::endl;
+                        reject_new_connection_with_429(client_fd); 
+                        continue;
+                    }
+                    int flags = fcntl(client_fd, F_GETFL, 0);
+                    if (flags == -1) {
+                        std::cerr << "fcntl(F_GETFL) failed" << std::endl;
+                        close(client_fd);
+                        continue;
+                    }
+
+                    if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+                        std::cerr << "fcntl(F_SETFL) failed" << std::endl;
+                        close(client_fd);
+                        continue;
+                    }
+                    struct epoll_event client_event;
+                    std::memset(&client_event, 0, sizeof(client_event));
+                    client_event.events = EPOLLIN;
+                    client_event.data.fd = client_fd;
+
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                        std::cerr << "epoll_ctl ADD client failed" << std::endl;
+                        close (client_fd);
+                        continue;
+                    }
+                    connections[client_fd] = Connection();
+                    
+                    std::cout << ">>> New Connection! IP: " << client_ip_str << ", FD: " << client_fd << std::endl;
+                    
                 }
-
-                // 【关键】设置非阻塞(必须!)
-                int flags = fcntl(client_fd, F_GETFL, 0);
-                fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-                // 打印日志
-                char client_ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-                std::cout << ">>> New Connection! IP: " << client_ip << ", FD: " << client_fd << std::endl;
-
-                // 【新增】将连接的 client_fd 也加入 Epoll 监听!
-                // 这样下次它有数据时, epoll_wait 也会通知我们
-                struct epoll_event client_event;
-                client_event.events = EPOLLIN;  // 关心它的读事件
-                client_event.data.fd = client_fd;
-
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
-                    std::cerr << "epoll_ctl ADD client failed" << std::endl;
-                    close (client_fd);
-                    continue;
-                } 
-
-                connections[client_fd] = Connection();
+                // ===== [Week2 Day5 修改结束：accept后增加IP限流] =====
                 continue;
                 
             } 
