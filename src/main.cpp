@@ -68,6 +68,10 @@ static const double kIpBucketRefillPerSec = 50.0;       // [Day5新增] 每秒�
 // static const double kIpBucketCapacity = 20.0;
 // static const double kIpBucketRefillPerSec = 1.0;
 // ======= [Week2 Day5 新增结束: IP限流常量] ================
+
+// ======= [Week2 Day6 新增开始: 连接数上限常量] ================
+static const size_t kMaxConnections = 200000;          // [Day6新增] 全局最大连接数 20 万
+// ======= [Week2 Day6 新增结束: 连接数上限常量] ================
 // ============================================================================
 // 连接结构
 // ============================================================================
@@ -101,6 +105,10 @@ std::vector<int> pending_close_queue;
 // =====================【Week2 Day4 新增】======================================
 // 全局 inflight 字节计数器
 size_t global_inflight_bytes = 0;
+
+// ======= [Week2 Day6 新增开始: 连接拒绝统计] ================
+size_t conn_reject_total = 0;                          // [Day6新增] 超过最大连接数时的拒绝计数
+// ======= [Week2 Day6 新增结束: 连接拒绝统计] ================
 
 // ======= [Week2 Day5 新增开始: IP桶结构和全局变量] ================
 struct IpBucket {
@@ -774,6 +782,20 @@ int main() {
                         close(client_fd);
                         continue;
                     }
+
+                    // ======= [Week2 Day6 新增开始: 最大连接数限制] ================
+                    if (connections.size() >= kMaxConnections) {
+                        ++conn_reject_total;
+                        std::cout << ">>> [Conn Reject] max_conns reached. "
+                                  << "FD: " << client_fd
+                                  << ", IP: " << client_ip_str
+                                  << ", conn_reject_total=" << conn_reject_total
+                                  << std::endl;
+                        close(client_fd);
+                        continue;
+                    }
+                    // ======= [Week2 Day6 新增结束: 最大连接数限制] ================
+
                     struct epoll_event client_event;
                     std::memset(&client_event, 0, sizeof(client_event));
                     client_event.events = EPOLLIN;
