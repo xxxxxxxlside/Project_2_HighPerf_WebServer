@@ -4,8 +4,11 @@ project(HighPerfWebServer)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
-# 暂时只编译 main.cpp
-add_executable(web_server src/main.cpp)
+include_directories(include)
 
-# 链接 pthread (多线程必备)
+add_executable(web_server
+    src/main.cpp
+    src/ip_rate_limit.cpp
+)
+
 target_link_libraries(web_server pthread)

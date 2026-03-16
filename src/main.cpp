@@ -25,6 +25,7 @@
 #include <list>         // LRU 链表
 #include <chrono>       // Token Bucket 时间计算
 // ======= [Week2 Day5 新增结束: 头文件] ========================
+#include "ip_rate_limit.h"
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -59,15 +60,7 @@ static const size_t kMaxInflightBytes = 512 * 1024 *1024;
 // 单请求 body 上限: 8MB
 static const int kMaxBodyBytes = 8 * 1024 * 1024;
 
-// ======= [Week2 Day5 新增开始: IP限流常量] ================
-static const size_t kIpBucketMaxEntries = 100000;       // [Day5新增] 最多记录 10 万个 IP
-static const int kIpBucketTtlSeconds = 600;             // [Day5新增] 10 分钟没访问就过期
-static const double kIpBucketCapcity = 200.0;           // [Day5新增] 桶容量 200
-static const double kIpBucketRefillPerSec = 50.0;       // [Day5新增] 每秒补充 50 个 token
-// 本地测试时可临时改成：
-// static const double kIpBucketCapacity = 20.0;
-// static const double kIpBucketRefillPerSec = 1.0;
-// ======= [Week2 Day5 新增结束: IP限流常量] ================
+
 
 // ======= [Week2 Day6 新增开始: 连接数上限常量] ================
 static const size_t kMaxConnections = 200000;          // [Day6新增] 全局最大连接数 20 万
@@ -110,17 +103,6 @@ size_t global_inflight_bytes = 0;
 size_t conn_reject_total = 0;                          // [Day6新增] 超过最大连接数时的拒绝计数
 // ======= [Week2 Day6 新增结束: 连接拒绝统计] ================
 
-// ======= [Week2 Day5 新增开始: IP桶结构和全局变量] ================
-struct IpBucket {
-    double tokens;      // [Day5新增] 当前剩余 token
-    std::chrono::steady_clock::time_point last_refill; // [Day5新增] 上次补充时间
-    std::chrono::steady_clock::time_point last_seen;   // [Day5新增] 上次访问时间
-    std::list<std::string>::iterator lru_it;           // [Day5新增] 在 LRU 链表中的位置
-};
-
-std::unordered_map<std::string, IpBucket> ip_buckets;  // [Day5新增] IP -> Bucket
-std::list<std::string> ip_lru;                         // [Day5新增] LRU 链表：头新尾旧
-// ======= [Week2 Day5 新增结束: IP桶结构和全局变量] ================
 
 // ============================================================================
 // 工具函数
@@ -284,120 +266,7 @@ void enqueue_ready(int fd, Connection& conn) {
     }
 }
 
-// ======= [Week2 Day5 新增开始: 更新LRU位置] ================
-void touch_ip_bucket_lru(const std::string& ip) {
-    auto it = ip_buckets.find(ip);
-    if (it == ip_buckets.end()) {
-        return;
-    }
 
-    ip_lru.erase(it->second.lru_it);
-    ip_lru.push_front(ip);
-    it->second.lru_it = ip_lru.begin();
-}
-// ======= [Week2 Day5 新增结束: 更新LRU位置] ================
-
-// ======= [Week2 Day5 新增开始: 清理过期IP桶] ================
-void cleanup_expired_ip_buckets() {
-    auto now = std::chrono::steady_clock::now();
-
-    while (!ip_lru.empty()) {
-        const std::string& oldest_ip = ip_lru.back();
-        auto it = ip_buckets.find(oldest_ip);
-        if (it == ip_buckets.end()) {
-            ip_lru.pop_back();
-            continue;
-        }
-
-        auto idle_sec = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_seen).count();
-        if (idle_sec < kIpBucketTtlSeconds) {
-            break;
-        }
-
-        ip_lru.pop_back();
-        ip_buckets.erase(it);
-    }
-}
-// ======= [Week2 Day5 新增结束: 清理过期IP桶] ================
-
-// ======= [Week2 Day5 新增开始: LRU淘汰超限IP] ================
-void evict_ip_buckets_if_needed() {
-    while (ip_buckets.size() > kIpBucketMaxEntries && !ip_lru.empty()) {
-        std::string oldest_ip = ip_lru.back();
-        ip_lru.pop_back();
-        ip_buckets.erase(oldest_ip);
-    }
-}
-// ======= [Week2 Day5 新增结束: LRU淘汰超限IP] ================
-
-// ======= [Week2 Day5 新增开始: 补充token] ================
-void refill_ip_bucket(IpBucket& bucket, const std::chrono::steady_clock::time_point& now) {
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - bucket.last_refill).count();
-
-    if (elapsed_ms <= 0) {
-        return;
-    }
-
-    double add_tokens = (elapsed_ms / 1000.0) * kIpBucketRefillPerSec;
-    bucket.tokens += add_tokens;
-    if (bucket.tokens > kIpBucketCapcity) {
-        bucket.tokens = kIpBucketCapcity;
-    }
-
-    bucket.last_refill = now;
-}
-// ======= [Week2 Day5 新增结束: 补充token] ================
-
-// ======= [Week2 Day5 新增开始: 消耗token并判断是否放行] ================
-bool consume_ip_token(const std::string& ip) {
-    cleanup_expired_ip_buckets();
-
-    auto now = std::chrono::steady_clock::now();
-    auto it = ip_buckets.find(ip);
-
-    // 第一次看到这个 IP: 创建一个满桶
-    if (it == ip_buckets.end()) {
-        ip_lru.push_front(ip);
-
-        IpBucket bucket;
-        bucket.tokens = kIpBucketCapcity;
-        bucket.last_refill = now;
-        bucket.last_seen = now;
-        bucket.lru_it = ip_lru.begin();
-
-        auto ret = ip_buckets.emplace(ip, bucket);
-        it = ret.first;
-
-        evict_ip_buckets_if_needed();
-    }
-
-    IpBucket& bucket = it->second;
-    refill_ip_bucket(bucket, now);
-    bucket.last_seen = now;
-    touch_ip_bucket_lru(ip);
-
-    if (bucket.tokens < 1.0) {
-        return false;
-    }
-
-    bucket.tokens -= 1.0;
-    return true;
-}
-// ======= [Week2 Day5 新增结束: 消耗token并判断是否放行] ================
-
-// ======= [Week2 Day5 新增开始: 429拒绝函数] ================
-void reject_new_connection_with_429(int fd) {
-    const char* resp =
-        "HTTP/1.1 429 Too Many Requests\r\n"
-        "Content-Length: 17\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Too Many Requests";
-
-    send(fd, resp, std::strlen(resp), MSG_NOSIGNAL);
-    close(fd);
-}
-// ======= [Week2 Day5 新增结束: 429拒绝函数] ================
 
 
 // 业务处理:构造响应
