@@ -9,6 +9,9 @@ include_directories(include)
 add_executable(web_server
     src/main.cpp
     src/ip_rate_limit.cpp
+    src/connection.cpp
+    src/buffer_utils.cpp
+    src/queue_utils.cpp
 )
 
 target_link_libraries(web_server pthread)

@@ -26,6 +26,9 @@
 #include <chrono>       // Token Bucket 时间计算
 // ======= [Week2 Day5 新增结束: 头文件] ========================
 #include "ip_rate_limit.h"
+#include "connection.h"
+#include "buffer_utils.h"
+#include "queue_utils.h"
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -55,11 +58,10 @@ static const size_t kMaxWriteBytesPerEvent = 256 * 1024;
 
 // =====================【Week2 Day4 新增】======================================
 // 全局 inflight 内存上限: 512MB
-static const size_t kMaxInflightBytes = 512 * 1024 *1024;
+const size_t kMaxInflightBytes = 512 * 1024 *1024;
 
 // 单请求 body 上限: 8MB
 static const int kMaxBodyBytes = 8 * 1024 * 1024;
-
 
 
 // ======= [Week2 Day6 新增开始: 连接数上限常量] ================
@@ -69,104 +71,15 @@ static const size_t kMaxConnections = 200000;          // [Day6新增] 全局最
 // 连接结构
 // ============================================================================
 
-// 连接状态结构体
-struct Connection {
-    std::string in_buffer; // 动态缓冲区，累积数据
-    // [Day 6 新增]: 输出缓冲区。所有要发给客户端的数据，必须先放进这里排队，决不允许直接 write
-    std::string out_buffer;
-    
-    // [Day 6 终极修复]: 必须把关闭状态绑定在连接对象上，防止异步写回期间局部变量丢失导致假死
-    bool is_closing;
-    bool in_ready_queue;
-    // ===================【Week2 Day3 新增】 ================
-    // 标记这个 fd 是否已经做过 close(fd)
-    // 防止重复 close
-    bool fd_closed;
-    Connection() : is_closing(false), in_ready_queue(false), fd_closed(false) {}
-};
-
-// 全局地图：fd -> Connection 对象
-std::unordered_map<int, Connection> connections;
-
-// ReadyQueue: 存“还有完整请求没处理完，但这轮预算已用完”的 fd
-std::deque<int> ready_queue; 
-
-// =====================【Week2 Day3 新增】======================================
-// 延迟释放队列：本轮里只登记，等本轮末尾再统一 erase
-std::vector<int> pending_close_queue;
-
-// =====================【Week2 Day4 新增】======================================
-// 全局 inflight 字节计数器
-size_t global_inflight_bytes = 0;
 
 // ======= [Week2 Day6 新增开始: 连接拒绝统计] ================
 size_t conn_reject_total = 0;                          // [Day6新增] 超过最大连接数时的拒绝计数
 // ======= [Week2 Day6 新增结束: 连接拒绝统计] ================
 
-
 // ============================================================================
 // 工具函数
 // ============================================================================
 
-// 判断 in_buffer 里是否至少有一个完整 HTTP 请求头
-bool has_complete_request(const Connection& conn) {
-    return conn.in_buffer.find("\r\n\r\n") != std::string::npos;
-}
-
-// =====================【Week2 Day4 新增】======================================
-// 统一追加到 in_buffer, 并维护 global_inflight_bytes
-bool append_to_in_buffer(Connection& conn, const char* data, size_t len) {
-    if (global_inflight_bytes + len > kMaxInflightBytes) {
-        return false;
-    }
-
-    conn.in_buffer.append(data, len);
-    global_inflight_bytes += len;
-    return true;
-}
-
-// =====================【Week2 Day4 新增】======================================
-// 统一追加到 out_buffer, 并维护 global_inflight_bytes
-bool append_to_out_buffer(Connection& conn, const std::string& data) {
-    if (global_inflight_bytes + data.size() > kMaxInflightBytes) {
-        return false;
-    }
-
-    conn.out_buffer += data;
-    global_inflight_bytes += data.size();
-    return true;
-}
-
-// =====================【Week2 Day4 新增】======================================
-// 从 in_buffer 删除前缀，并维护 global_inflight_bytes
-void erase_from_in_buffer_prefix(Connection& conn, size_t len) {
-    if (len > conn.in_buffer.size()) {
-        len = conn.in_buffer.size();
-    }
-
-    conn.in_buffer.erase(0, len);
-    global_inflight_bytes -= len;
-}
-
-// =====================【Week2 Day4 新增】======================================
-// 从 out_buffer 删除前缀，并维护 global_inflight_bytes
-void erase_from_out_buffer_prefix(Connection& conn, size_t len) {
-    if (len > conn.out_buffer.size()) {
-        len = conn.out_buffer.size();
-    }
-
-    conn.out_buffer.erase(0, len);
-    global_inflight_bytes -= len;
-}
-
-// =====================【Week2 Day4 新增】======================================
-// 释放某个连续剩余 buffer 占用的 inflight 计数
-void release_connection_buffers(Connection& conn) {
-    global_inflight_bytes -= conn.in_buffer.size();
-    global_inflight_bytes -= conn.out_buffer.size();
-    conn.in_buffer.clear();
-    conn.out_buffer.clear();
-}
 
 // 更新 epoll 里这个 fd 关心的事件
 void update_epoll_events(int epoll_fd, int fd, const Connection& conn) {
@@ -189,84 +102,6 @@ void update_epoll_events(int epoll_fd, int fd, const Connection& conn) {
         std::cerr << "epoll_ctl MOD failed for fd =" << fd << " errno=" << errno << std::endl;
     }
 }
-// =====================【Week2 Day3 新增】======================================
-// 从 ReadyQueue 中摘掉指定 fd
-void remove_from_ready_queue(int fd, Connection& conn) {
-    if (!conn.in_ready_queue) {
-        return;
-    }
-
-    std::deque<int> new_queue;
-    while(!ready_queue.empty()) {
-        int cur = ready_queue.front();
-        ready_queue.pop_front();
-        if (cur != fd) {
-            new_queue.push_back(cur);
-        }
-    }
-    ready_queue.swap(new_queue);
-    conn.in_ready_queue = false;
-}
-
-// =====================【Week2 Day3 新增】======================================
-// 唯一关闭入口：只负责“发起关闭”
-// 流程：closing-true -> 从 ReadyQueue 摘除 -> epoll DEL -> close(fd)
-// -> 标记 fd_closed -> 放入 pending_close_queue 等待本轮末尾统一 erase
-void request_close(int epoll_fd, int fd, Connection& conn) {
-    if (conn.is_closing && conn.fd_closed) {
-        return;
-    }
-
-    if (!conn.is_closing) {
-        conn.is_closing = true;
-    }
-
-    remove_from_ready_queue(fd, conn);
-
-    if (!conn.fd_closed) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-        close(fd);
-        conn.fd_closed = true;
-        pending_close_queue.push_back(fd);
-
-        std::cout << ">>> [Close Requested] FD: " << fd << std::endl;
-    }
-}
-
-// =====================【Week2 Day3 新增】======================================
-// 本轮末尾统一真正释放 connection 对象
-void flush_pending_close_queue() {
-    for (int fd : pending_close_queue) {
-        auto it = connections.find(fd);
-        if (it != connections.end()) {
-            std::cout << ">>> [Final Release] FD: " << fd << std::endl;
-
-            // =====================【Week2 Day4 新增】======================================
-            // 真正 erase 前，把这个连接还占着的 buffer 字节数扣掉
-            release_connection_buffers(it->second);
-
-            connections.erase(it);
-        }
-    }
-    pending_close_queue.clear();
-}
-
-
-// 入队 ReadyQueue (防止重复入队)
-void enqueue_ready(int fd, Connection& conn) {
-    // =====================【Week2 Day3 新增】======================================
-    // closing 状态下不再入队
-    if (conn.is_closing || conn.fd_closed) {
-        return;
-    }
-    
-    if (!conn.in_ready_queue) {
-        ready_queue.push_back(fd);
-        conn.in_ready_queue = true;
-    }
-}
-
-
 
 
 // 业务处理:构造响应
