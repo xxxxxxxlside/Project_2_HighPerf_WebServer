@@ -1,6 +1,7 @@
 #include "accept_utils.h"
 #include "connection.h"
 #include "ip_rate_limit.h"
+#include "timer_utils.h"
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -74,11 +75,25 @@ void accept_new_connections(int epoll_fd, int listen_fd) {
 
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
             std::cerr << "epoll_ctl ADD client failed" << std::endl;
-            close (client_fd);
+            close(client_fd);
             continue;
         }
         connections[client_fd] = Connection();
+
+        Connection& conn = connections[client_fd];
+        int64_t now_ms = now_ms_monotonic();
+
+        conn.last_active_ms = now_ms;
+        conn.header_deadline_ms = now_ms + 10 * 1000;
+        conn.header_complete = false;
+
+        ++conn.header_timer_version;
+        push_timer(client_fd, conn.header_deadline_ms, conn.header_timer_version, TimerType::HeaderTimeout);
+
+        ++conn.idle_timer_version;
+        push_timer(client_fd, now_ms + 60 * 1000, conn.idle_timer_version, TimerType::IdleTimeout);
         
+
         std::cout << ">>> New Connection! IP: " << client_ip_str << ", FD: " << client_fd << std::endl;
         
     }
