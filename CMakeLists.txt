@@ -12,6 +12,9 @@ add_executable(web_server
     src/connection.cpp
     src/buffer_utils.cpp
     src/queue_utils.cpp
+    src/io_utils.cpp
+    src/http_logic.cpp
+    src/accept_utils.cpp
 )
 
 target_link_libraries(web_server pthread)

@@ -21,5 +21,11 @@ extern std::deque<int> ready_queue;
 extern std::deque<int> pending_close_queue;
 extern size_t global_inflight_bytes;
 extern const size_t kMaxInflightBytes;
+extern const int kMaxRequestsPerRound;
+extern const int kMaxBodyBytes;
+extern const size_t kMaxWriteBytesPerEvent;
+extern const size_t kMaxReadBytesPerEvent;
+extern const size_t kMaxConnections;
+extern size_t conn_reject_total;
 
 #endif

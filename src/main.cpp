@@ -29,6 +29,9 @@
 #include "connection.h"
 #include "buffer_utils.h"
 #include "queue_utils.h"
+#include "io_utils.h"
+#include "http_logic.h"
+#include "accept_utils.h"
 
 // ============================================================================
 // 宏定义区域：错误处理工具
@@ -45,295 +48,27 @@
 // 常量定义
 // ===========================================================================
 static const int kMaxEvents = 128;
-static const int kMaxRequestsPerRound = 5;
+const int kMaxRequestsPerRound = 5;
 
 // ===========================================================================
 // 【Week2 Day2 新增】
 // ===========================================================================
 // 单轮读预算：最多读取 256KB
-static const size_t kMaxReadBytesPerEvent = 256 * 1024;
+const size_t kMaxReadBytesPerEvent = 256 * 1024;
 
 // 单轮写预算：最多写出 256KB
-static const size_t kMaxWriteBytesPerEvent = 256 * 1024;
+const size_t kMaxWriteBytesPerEvent = 256 * 1024;
 
 // =====================【Week2 Day4 新增】======================================
 // 全局 inflight 内存上限: 512MB
 const size_t kMaxInflightBytes = 512 * 1024 *1024;
 
 // 单请求 body 上限: 8MB
-static const int kMaxBodyBytes = 8 * 1024 * 1024;
+const int kMaxBodyBytes = 8 * 1024 * 1024;
 
 
 // ======= [Week2 Day6 新增开始: 连接数上限常量] ================
-static const size_t kMaxConnections = 200000;          // [Day6新增] 全局最大连接数 20 万
-// ======= [Week2 Day6 新增结束: 连接数上限常量] ================
-// ============================================================================
-// 连接结构
-// ============================================================================
-
-
-// ======= [Week2 Day6 新增开始: 连接拒绝统计] ================
-size_t conn_reject_total = 0;                          // [Day6新增] 超过最大连接数时的拒绝计数
-// ======= [Week2 Day6 新增结束: 连接拒绝统计] ================
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-
-// 更新 epoll 里这个 fd 关心的事件
-void update_epoll_events(int epoll_fd, int fd, const Connection& conn) {
-    // =====================【Week2 Day3 新增】======================================
-    // 只有 fd 真正关闭后，才不再修改 epoll 事件
-    if (conn.fd_closed) {
-        return;
-    }
-    
-    struct epoll_event ev;
-    ev.data.fd = fd;
-    ev.events = EPOLLIN;
-
-    // 只要还有数据没发完，就继续关心 EPOLLOUT
-    if (!conn.out_buffer.empty()) {
-        ev.events |= EPOLLOUT;
-    }
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) {
-        std::cerr << "epoll_ctl MOD failed for fd =" << fd << " errno=" << errno << std::endl;
-    }
-}
-
-
-// 业务处理:构造响应
-void handle_request(int fd, Connection& conn, const std::string& request_line) {
-   
-    std::cout << ">>> [Request] FD " << fd << " Method-Line: " << request_line << std::endl;
-
-    std::string resp = 
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 2\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "OK";
-    
-    // =====================【Week2 Day4 新增】======================================
-    // 不再直接 out_buffer += resp
-    // 改成统一走 append_to_out_buffer,顺带做 inflight budget 检查
-    if (!append_to_out_buffer(conn, resp)) {
-        std::cerr << ">>> [Inflight Budget] Response append exceeds limit." << "Sending 503..." << std::endl;
-        conn.out_buffer.clear(); // 这里 clear 不需要扣计数，因为 append 失败根本没加进去
-
-        std::string err_resp =
-            "HTTP/1.1 503 Service Unavailable\r\n"
-            "Connection: Close\r\n"
-            "\r\n";
-        append_to_out_buffer(conn, err_resp);
-    }
-
-    
-    conn.is_closing = true;
-}
-
-// =============================【Week Day2 修改】=============================================
-// 改成"代写预算"的 best-effort write
-// 一次可写事件里，最多写 kMaxWriteBytesPerEvent
-
-void write_best_effort_with_budget(int fd, Connection& conn, bool& io_error) {
-    
-    ssize_t written_this_round = 0;
-
-    while (!conn.out_buffer.empty() && written_this_round < kMaxWriteBytesPerEvent) {
-        size_t remain_budget = kMaxWriteBytesPerEvent - written_this_round;
-        size_t try_write = conn.out_buffer.size();
-
-        if (try_write > remain_budget) {
-            try_write = remain_budget;
-        }
-
-        ssize_t w = send(fd,
-                        conn.out_buffer.data(),
-                        try_write,
-                        MSG_NOSIGNAL);
-        if (w > 0) {
-            // =====================【Week2 Day4 修改】======================================
-            // 不再直接 erase. 改成统一扣减 inflight 计数
-            erase_from_out_buffer_prefix(conn, static_cast<size_t>(w));
-
-            written_this_round += static_cast<size_t>(w);
-        } else if (w == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // 本轮先停，等下一次 EPOLLOUT
-            break;
-        } else {
-            io_error = true;
-            break;
-        }
-    }
-    
-}
-
-// =============================================================================
-// Week2 Day1 核心: 单轮最多处理 5 个完整请求
-// 如果还有完整请求残留，则放入 ReadyQueue 等待下一轮继续处理
-// =============================================================================
-void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
-    int processed = 0;
-
-    while (!conn.is_closing && processed < kMaxRequestsPerRound) {
-        std::size_t pos = conn.in_buffer.find("\r\n\r\n");
-        if (pos == std::string::npos) {
-            break;
-        }
-
-        // Header 总长度
-        int header_total_len = static_cast<int>(pos + 4);
-        std::string headers = conn.in_buffer.substr(0, pos);
-
-        // 1. Request Line
-        std::size_t line_end = headers.find("\r\n");
-        std::string request_line;
-        if (line_end != std::string::npos) {
-            request_line = headers.substr(0, line_end);
-            std::cout << ">>> [Parse] FD " << fd << " Request: " << request_line << std::endl;
-        }
-
-        // 2. 防御: 拒绝 chunked
-        if (headers.find("Transfer-Encoding: chunked") != std::string::npos || headers.find("Transfer-encoding: Chunked") != std::string::npos) {
-            std::cerr << ">>> [DoS Defense] Chunked not supported on FD " << fd << ". Sending 501..." << std::endl;
-
-            // =====================【Week2 Day4 修改】======================================
-            std::string err_resp = 
-                "HTTP/1.1 501 Not Implemented\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-            append_to_out_buffer(conn, err_resp);
-            // =============================================
-            conn.is_closing = true;
-            break;
-        
-        }
-
-        // 3. 解析 Content-Length
-        int content_length = 0;
-        std::size_t cl_pos = headers.find("Content-Length:");
-        if (cl_pos != std::string::npos) {
-            std::size_t value_start = cl_pos + std::strlen("Content-Length:");
-            while (value_start < headers.size() && headers[value_start] == ' ') {
-                ++value_start;
-            }
-
-            std::size_t value_end = headers.find("\r\n", value_start);
-            std::string value_str = headers.substr(value_start, value_end - value_start);
-            content_length = std::atoi(value_str.c_str());
-        }
-
-        // =====================【Week2 Day4 新增】==============================
-        // Body 大小限制: > 8MB 直接 413 + close
-        if (content_length > kMaxBodyBytes) {
-            std::cerr << ">>> [Body Limit] Content-Length too large on Fd" << fd << ". Sending 413..." << std::endl;
-            std::string err_resp = 
-                "HTTP/1.1 413 Payload Too Large\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-            append_to_out_buffer(conn, err_resp);
-            conn.is_closing = true;
-            break;
-        }
-        // =====================================================
-        // 4. 检查整个请求是否收全 (header + body)
-        if (static_cast<int>(conn.in_buffer.size()) < header_total_len + content_length) {
-            break;
-        }
-
-        // 5. 完整请求到齐，交给业务处理
-        handle_request(fd,conn, request_line);
-
-        // =====================【Week2 Day4 修改】==============================
-        // 不再直接 erase in_buffer, 改成统一扣减 inflight 计数
-        erase_from_in_buffer_prefix(conn, static_cast<size_t>(header_total_len + content_length));
-        // ==========================================================
-        ++processed;
-    }
-
-    // 如果这轮预算用完了, 但 buffer 里还有完整请求, 加入 ReadyQueue
-    if (!conn.is_closing && processed >= kMaxRequestsPerRound && has_complete_request(conn)) {
-        std::cout << ">>> [ReadyQueue] FD " << fd << " still has complete requests, defer to next round." << std::endl;
-        enqueue_ready(fd, conn);
-    }
-
-    update_epoll_events(epoll_fd, fd, conn);
-}
-
-// ==========================【Week Day2 新增】===============================
-// 带读预算的读取逻辑：一次 EPOLLIN 最多读 256KB
-void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
-    char temp_buf[4096];
-    size_t read_this_round = 0;
-
-    while (!conn.is_closing && read_this_round < kMaxReadBytesPerEvent) {
-        size_t remain_budget = kMaxReadBytesPerEvent - read_this_round;
-        size_t try_read = sizeof(temp_buf);
-
-        if (try_read > remain_budget) {
-            try_read = remain_budget;
-        }
-
-        ssize_t n = read(fd, temp_buf, try_read);
-
-        if (n > 0) {
-            // =====================【Week2 Day4 修改】==============================
-            // 不再直接 append 到 in_buffer
-            // 改正统一做 inflight budget 检查
-            if (!append_to_in_buffer(conn, temp_buf, static_cast<size_t>(n))) {
-                std::cerr << ">>> [Inflight Budget] In-buffer append exceeds limit on FD " << fd << ". Sending 503..." << std::endl;
-                std::string err_resp =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Connection: close\r\n"
-                    "\r\n";
-                append_to_out_buffer(conn, err_resp);
-                conn.is_closing = true;
-                break;
-            }
-            // ================================================
-
-            
-            
-            read_this_round += static_cast<size_t>(n);
-
-            // Header 超过 8KB 的防御
-            std::size_t pos = conn.in_buffer.find("\r\n\r\n");
-            if ((pos == std::string::npos && conn.in_buffer.size() > 8192) || (pos != std::string::npos && pos > 8192)) {
-                std::cerr << ">>> [DoS Defense] Header > 8KB from FD " << fd << ". Sending 431..." << std::endl;
-                // =====================【Week2 Day4 修改】==============================
-                std::string err_resp=
-                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
-                    "Connection: close\r\n"
-                    "\r\n";
-                append_to_out_buffer(conn, err_resp);
-                // =====================================================
-                conn.is_closing = true;
-                break; 
-            }
-
-            // 每次读进来后，尽量解析请求
-            process_requests_with_limit(epoll_fd, fd, conn);
-
-            // 如果业务已经决定关闭，就不用继续读了
-            if (conn.is_closing) {
-                break;
-            }
-        }else if (n == 0) {
-            // 对端关闭连接
-            conn.is_closing = true;
-            break;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // 当前 socket 已经没数据了
-            break;
-        } else {
-            io_error = true;
-            break;
-        }
-    }
-}
+const size_t kMaxConnections = 200000;          // [Day6新增] 全局最大连接数 20 万
 
 // =============================================================================
 // 主函数
@@ -418,8 +153,6 @@ int main() {
     }
     std::cout << ">>> Epoll initiallized. Listening for events..." << std::endl;
     
-
-    
     // ==========================================================
     // 3. 事件循环 (Event Loop)
     // ==========================================================
@@ -447,77 +180,9 @@ int main() {
             // ------------------------------------------------------
             if (fd == listen_fd) {
                 // ===== [Week2 Day5 修改开始：accept后增加IP限流] =====
-                while(true) {
-                    struct sockaddr_in client_addr;
-                    std::memset(&client_addr, 0, sizeof(client_addr));
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-                    if (client_fd == -1) {
-                        if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-                        std::cerr << "accept failed, errno=" << errno << std::endl;
-                        break;
-                    }
-
-                    char client_ip[INET_ADDRSTRLEN] = {0}; // [Day5新增]
-                    const char* ip_cstr = inet_ntop(
-                        AF_INET,
-                        &client_addr.sin_addr,
-                        client_ip,
-                        INET_ADDRSTRLEN
-                    );
-                    std::string client_ip_str = ip_cstr ? client_ip : "unknown"; // [Day5新增]
-                    // [Day5新增]
-                    if (!consume_ip_token(client_ip_str)) {
-                        std::cout << ">>> [429 Reject] ip=" << client_ip_str << std::endl;
-                        reject_new_connection_with_429(client_fd); 
-                        continue;
-                    }
-                    int flags = fcntl(client_fd, F_GETFL, 0);
-                    if (flags == -1) {
-                        std::cerr << "fcntl(F_GETFL) failed" << std::endl;
-                        close(client_fd);
-                        continue;
-                    }
-
-                    if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-                        std::cerr << "fcntl(F_SETFL) failed" << std::endl;
-                        close(client_fd);
-                        continue;
-                    }
-
-                    // ======= [Week2 Day6 新增开始: 最大连接数限制] ================
-                    if (connections.size() >= kMaxConnections) {
-                        ++conn_reject_total;
-                        std::cout << ">>> [Conn Reject] max_conns reached. "
-                                  << "FD: " << client_fd
-                                  << ", IP: " << client_ip_str
-                                  << ", conn_reject_total=" << conn_reject_total
-                                  << std::endl;
-                        close(client_fd);
-                        continue;
-                    }
-                    // ======= [Week2 Day6 新增结束: 最大连接数限制] ================
-
-                    struct epoll_event client_event;
-                    std::memset(&client_event, 0, sizeof(client_event));
-                    client_event.events = EPOLLIN;
-                    client_event.data.fd = client_fd;
-
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
-                        std::cerr << "epoll_ctl ADD client failed" << std::endl;
-                        close (client_fd);
-                        continue;
-                    }
-                    connections[client_fd] = Connection();
-                    
-                    std::cout << ">>> New Connection! IP: " << client_ip_str << ", FD: " << client_fd << std::endl;
-                    
-                }
+                accept_new_connections(epoll_fd, listen_fd);
                 // ===== [Week2 Day5 修改结束：accept后增加IP限流] =====
                 continue;
-                
             } 
             // --------------------------------------------------
             // 情况 B: 客户端数据达到 (Day 4 彻底重写)
