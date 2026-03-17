@@ -19,6 +19,7 @@ struct Connection {
     bool in_ready_queue;
     bool fd_closed;
     bool header_complete = false;
+    bool body_receiving = false;
 
     Connection() : is_closing(false), in_ready_queue(false), fd_closed(false) {}
     
@@ -26,6 +27,9 @@ struct Connection {
     int64_t header_deadline_ms = 0;
     uint64_t header_timer_version = 0;
     uint64_t idle_timer_version = 0;
+    int body_expected_bytes = 0;
+    int64_t body_deadline_ms = 0;
+    uint64_t body_timer_version = 0;
 };
 
 extern std::unordered_map<int, Connection> connections;

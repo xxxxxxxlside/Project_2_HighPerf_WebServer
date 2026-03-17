@@ -96,6 +96,22 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
             content_length = std::atoi(value_str.c_str());
         }
 
+        bool is_post = request_line.rfind("POST ", 0) == 0;
+        bool has_content_length = (cl_pos != std::string::npos);
+
+        if (is_post && !has_content_length) {
+            std::cerr << ">>> [Protocol] POST without Content-Length on FD "
+                      << fd << ". Sending 411..." << std::endl;
+
+            std::string err_resp =
+                "HTTP/1.1 411 Length Required\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            append_to_out_buffer(conn, err_resp);
+            conn.is_closing = true;
+            break;
+        }
+
         // =====================【Week2 Day4 新增】==============================
         // Body 大小限制: > 8MB 直接 413 + close
         if (content_length > kMaxBodyBytes) {
@@ -111,10 +127,37 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
         // =====================================================
         // 4. 检查整个请求是否收全 (header + body)
         if (static_cast<int>(conn.in_buffer.size()) < header_total_len + content_length) {
+            if (content_length > 0 && !conn.body_receiving) {
+                conn.body_receiving = true;
+                conn.body_expected_bytes = content_length;
+
+                int64_t now_ms = now_ms_monotonic();
+
+                int body_window_sec = content_length / 65536;
+                if (body_window_sec < 30) {
+                    body_window_sec = 30;
+                }
+                if (body_window_sec > 120) {
+                    body_window_sec = 120;
+                }
+
+                conn.body_deadline_ms = now_ms + static_cast<int64_t>(body_window_sec) * 1000;
+
+                ++conn.body_timer_version;
+                push_timer(fd, conn.body_deadline_ms, conn.body_timer_version, TimerType::BodyTimeout);
+            }
             break;
         }
 
         // 5. 完整请求到齐，交给业务处理
+        if (conn.body_receiving) {
+            conn.body_receiving = false;
+            conn.body_expected_bytes = 0;
+            conn.body_deadline_ms = 0;
+
+            ++conn.body_timer_version;   // 让旧的 body timeout 节点失效
+        }
+
         handle_request(fd,conn, request_line);
 
         // =====================【Week2 Day4 修改】==============================

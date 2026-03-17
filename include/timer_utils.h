@@ -6,6 +6,7 @@
 
 enum class TimerType {
     HeaderTimeout,
+    BodyTimeout,
     IdleTimeout
 };
 

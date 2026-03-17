@@ -126,6 +126,21 @@ int main() {
                 request_close(epoll_fd, node.fd, conn);
                 continue;
             }
+            if (node.type == TimerType::BodyTimeout) {
+                if (node.version != conn.body_timer_version) {
+                    continue;
+                }
+                if (!conn.body_receiving) {
+                    continue;
+                }
+                if (now_ms < conn.body_deadline_ms) {
+                    continue;
+                }
+
+                std::cout << ">>> [Timer] Body timeout, fd=" << node.fd << std::endl;
+                request_close(epoll_fd, node.fd, conn);
+                continue;
+            }
 
             if (node.type == TimerType::IdleTimeout) {
                 if (node.version != conn.idle_timer_version) {
