@@ -1,4 +1,5 @@
 build/
+build_asan_ubsan/
 *.log
 *.o
 web_server

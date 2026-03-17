@@ -1,3 +1,4 @@
+// 这个文件负责驱动主 EventLoop，并实现 day4 为 sanitizer 自测补的退出收尾逻辑。
 #include <iostream>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -5,6 +6,8 @@
 #include <chrono>
 #include <string>
 #include <sstream>
+#include <vector>
+#include <cerrno>
 
 #include "connection.h"
 #include "queue_utils.h"
@@ -23,6 +26,7 @@ const size_t kMaxInflightBytes = 512 * 1024 * 1024;
 const int kMaxBodyBytes = 8 * 1024 * 1024;
 const size_t kMaxConnections = 200000;
 
+// 统一处理尽力写回和关闭判定，避免收尾路径分散。
 static void flush_write_and_maybe_close(int epoll_fd, int fd, Connection& conn, bool try_write_now) {
     bool io_error = false;
 
@@ -36,6 +40,7 @@ static void flush_write_and_maybe_close(int epoll_fd, int fd, Connection& conn, 
     }
 }
 
+// metrics 日志用它读取当前 RSS，便于观察长跑时内存是否稳定。
 static size_t get_rss_kb() {
     std::ifstream status_file("/proc/self/status");
     std::string line;
@@ -57,6 +62,8 @@ static size_t get_rss_kb() {
 int main() {
     int listen_fd = -1;
     int epoll_fd = -1;
+    // day4 自测要求进程能被脚本优雅停掉，否则不利于 sanitizer 做退出检查。
+    install_signal_handlers();
     init_server(listen_fd, epoll_fd);
 
     std::ofstream metrics_log("metrics.log", std::ios::app);
@@ -65,11 +72,15 @@ int main() {
 
     struct epoll_event events[kMaxEvents];
 
-    while (true) {
+    // 收到 SIGINT/SIGTERM 后跳出主循环，转入统一收尾。
+    while (!stop_requested()) {
         int wait_ms = get_next_timer_wait_ms(1000);
         int nfds = epoll_wait(epoll_fd, events, kMaxEvents, wait_ms);
 
         if (nfds == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
             ++errors_total;
             std::cerr << "epoll_wait failed" << std::endl;
             break;
@@ -215,7 +226,29 @@ int main() {
         }
     }
 
-    close(listen_fd);
-    close(epoll_fd);
+    // 退出主循环后，不直接退进程；先把仍存活的连接走一遍统一关闭入口。
+    std::vector<int> open_fds;
+    open_fds.reserve(connections.size());
+    for (const auto& entry : connections) {
+        open_fds.push_back(entry.first);
+    }
+
+    for (int fd : open_fds) {
+        auto it = connections.find(fd);
+        if (it != connections.end()) {
+            request_close(epoll_fd, fd, it->second);
+        }
+    }
+
+    // 最后统一释放连接对象并清空 timer，尽量让 sanitizer 在退出前看到干净状态。
+    flush_pending_close_queue();
+    clear_all_timers();
+
+    if (listen_fd != -1) {
+        close(listen_fd);
+    }
+    if (epoll_fd != -1) {
+        close(epoll_fd);
+    }
     return 0;
 }

@@ -1,3 +1,4 @@
+// 这个文件负责启动期 socket/epoll 初始化，以及 day4 为 sanitizer 自测补的信号退出支持。
 #include "startup_utils.h"
 
 #include <sys/epoll.h>
@@ -9,7 +10,34 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <csignal>
 
+namespace {
+// 只做最小标记，不在信号处理器里执行复杂逻辑。
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void handle_stop_signal(int) {
+    g_stop_requested = 1;
+}
+}
+
+// 主循环通过这个标记判断是否该退出，并进入统一收尾。
+bool stop_requested() {
+    return g_stop_requested != 0;
+}
+
+// 自测脚本结束时会发 SIGTERM，这里把它收口成一个可轮询的退出标记。
+void install_signal_handlers() {
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_stop_signal;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
+// 启动时一次性完成监听 socket 和 epoll 初始化。
 void init_server(int& listen_fd, int& epoll_fd) {
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     
@@ -44,11 +72,6 @@ void init_server(int& listen_fd, int& epoll_fd) {
     }
 
     int listen_flags = fcntl(listen_fd, F_GETFL, 0);
-
-    if (listen(listen_fd, 128) < 0) {
-        std::cerr << "listen failed (errno: " << errno << ")\n";
-        return;
-    }
 
     if (fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK) < 0) {
         std::cerr << "fcntl(F_SETFL) on listen_fd failed (errno: " << errno << ")\n";

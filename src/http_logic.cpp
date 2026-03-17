@@ -1,3 +1,4 @@
+// 这个文件负责 HTTP 读入、解析和响应生成，本次还修了错误响应可能发不出去的收尾问题。
 #include "http_logic.h"
 #include "buffer_utils.h"
 #include "queue_utils.h"
@@ -10,7 +11,7 @@
 
 
 void handle_request(int fd, Connection& conn, const std::string& request_line) {
-   
+    // 当前 MVP 业务很简单：收到完整合法请求后返回固定 200 OK。
     std::cout << ">>> [Request] FD " << fd << " Method-Line: " << request_line << std::endl;
 
     std::string resp = 
@@ -185,6 +186,7 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
     update_epoll_events(epoll_fd, fd, conn);
 }
 
+// 按预算读 socket，并在读路径里完成 header/body 的边界防御。
 void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
     char temp_buf[4096];
     size_t read_this_round = 0;
@@ -264,5 +266,8 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
             break;
         }
     }
-}
 
+    // day4 修复点：如果读路径里提前构造了 431/503 等错误响应，也要补一次事件更新，
+    // 否则可能没有注册 EPOLLOUT，导致错误响应留在 out_buffer 里发不出去。
+    update_epoll_events(epoll_fd, fd, conn);
+}
