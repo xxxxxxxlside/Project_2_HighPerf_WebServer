@@ -2,6 +2,7 @@
 #include "buffer_utils.h"
 #include "queue_utils.h"
 #include "io_utils.h"
+#include "timer_utils.h"
 
 #include <iostream>
 #include <cstring>
@@ -44,6 +45,13 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
         std::size_t pos = conn.in_buffer.find("\r\n\r\n");
         if (pos == std::string::npos) {
             break;
+        }
+
+        if (!conn.header_complete) {
+            conn.header_complete = true;
+            conn.header_deadline_ms = 0;
+
+            ++conn.header_timer_version;   // 让旧的 header timeout 节点失效
         }
 
         // Header 总长度
@@ -140,6 +148,12 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
         ssize_t n = read(fd, temp_buf, try_read);
 
         if (n > 0) {
+            int64_t now_ms = now_ms_monotonic();
+            conn.last_active_ms = now_ms;
+
+            ++conn.idle_timer_version;
+            push_timer(fd, now_ms + 60 * 1000, conn.idle_timer_version, TimerType::IdleTimeout);
+
             // =====================【Week2 Day4 修改】==============================
             // 不再直接 append 到 in_buffer
             // 改正统一做 inflight budget 检查
@@ -181,7 +195,7 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
             }
         }else if (n == 0) {
             // 对端关闭连接
-            conn.is_closing = true;
+            request_close(epoll_fd, fd, conn);
             break;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // 当前 socket 已经没数据了

@@ -16,6 +16,7 @@ add_executable(web_server
     src/http_logic.cpp
     src/accept_utils.cpp
     src/startup_utils.cpp
+    src/timer_utils.cpp
 )
 
 target_link_libraries(web_server pthread)

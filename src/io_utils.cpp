@@ -1,5 +1,6 @@
 #include "io_utils.h"
 #include "buffer_utils.h"
+#include "timer_utils.h"
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -45,6 +46,11 @@ void write_best_effort_with_budget(int fd, Connection& conn, bool& io_error) {
                         try_write,
                         MSG_NOSIGNAL);
         if (w > 0) {
+            int64_t now_ms = now_ms_monotonic();
+            conn.last_active_ms = now_ms;
+
+            ++conn.idle_timer_version;
+            push_timer(fd, now_ms + 60 * 1000,conn.idle_timer_version, TimerType::IdleTimeout);
             // =====================【Week2 Day4 修改】======================================
             // 不再直接 erase. 改成统一扣减 inflight 计数
             erase_from_out_buffer_prefix(conn, static_cast<size_t>(w));
