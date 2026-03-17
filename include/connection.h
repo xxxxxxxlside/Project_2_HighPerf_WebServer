@@ -44,4 +44,17 @@ extern const size_t kMaxReadBytesPerEvent;
 extern const size_t kMaxConnections;
 extern size_t conn_reject_total;
 
+extern uint64_t accept_total;
+extern uint64_t conns_current;
+extern uint64_t requests_total;
+extern uint64_t errors_total;
+extern uint64_t reject_total;
+
+extern uint64_t reject_411_total;
+extern uint64_t reject_413_total;
+extern uint64_t reject_429_total;
+extern uint64_t reject_431_total;
+extern uint64_t reject_501_total;
+extern uint64_t reject_503_total;
+
 #endif

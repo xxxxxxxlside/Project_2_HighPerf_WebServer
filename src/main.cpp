@@ -1,6 +1,10 @@
 #include <iostream>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <fstream>
+#include <chrono>
+#include <string>
+#include <sstream>
 
 #include "connection.h"
 #include "queue_utils.h"
@@ -9,6 +13,7 @@
 #include "accept_utils.h"
 #include "startup_utils.h"
 #include "timer_utils.h"
+
 
 static const int kMaxEvents = 128;
 const int kMaxRequestsPerRound = 5;
@@ -31,10 +36,32 @@ static void flush_write_and_maybe_close(int epoll_fd, int fd, Connection& conn, 
     }
 }
 
+static size_t get_rss_kb() {
+    std::ifstream status_file("/proc/self/status");
+    std::string line;
+
+    while (std::getline(status_file, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            size_t value = 0;
+            std::string unit;
+            iss >> key >> value >> unit;
+            return value;
+        }
+    }
+
+    return 0;
+}
+
 int main() {
     int listen_fd = -1;
     int epoll_fd = -1;
     init_server(listen_fd, epoll_fd);
+
+    std::ofstream metrics_log("metrics.log", std::ios::app);
+    int64_t start_ms = now_ms_monotonic();
+    int64_t last_metrics_ms = 0;
 
     struct epoll_event events[kMaxEvents];
 
@@ -43,6 +70,7 @@ int main() {
         int nfds = epoll_wait(epoll_fd, events, kMaxEvents, wait_ms);
 
         if (nfds == -1) {
+            ++errors_total;
             std::cerr << "epoll_wait failed" << std::endl;
             break;
         }
@@ -159,6 +187,32 @@ int main() {
         }
 
         flush_pending_close_queue();
+
+        int64_t metrics_now_ms = now_ms_monotonic();
+        if (last_metrics_ms == 0 || metrics_now_ms - last_metrics_ms >= 1000) {
+            int64_t uptime_s = (metrics_now_ms - start_ms) / 1000;
+            size_t rss_kb = get_rss_kb();
+            metrics_log
+                << "ts=" << metrics_now_ms
+                << " uptime_s=" << uptime_s
+                << " rss_kb=" << rss_kb
+                << " accept_total=" << accept_total
+                << " conns_current=" << conns_current
+                << " requests_total=" << requests_total
+                << " errors_total=" << errors_total
+                << " reject_total=" << reject_total
+                << " reject_411_total=" << reject_411_total
+                << " reject_413_total=" << reject_413_total
+                << " reject_429_total=" << reject_429_total
+                << " reject_431_total=" << reject_431_total
+                << " reject_501_total=" << reject_501_total
+                << " reject_503_total=" << reject_503_total
+                << " global_inflight_bytes_current=" << global_inflight_bytes
+                << "\n";
+
+            metrics_log.flush();
+            last_metrics_ms = metrics_now_ms;
+        }
     }
 
     close(listen_fd);

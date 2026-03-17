@@ -38,6 +38,9 @@ void accept_new_connections(int epoll_fd, int listen_fd) {
         std::string client_ip_str = ip_cstr ? client_ip : "unknown"; // [Day5新增]
         // [Day5新增]
         if (!consume_ip_token(client_ip_str)) {
+            ++reject_total;
+            ++reject_429_total;
+
             std::cout << ">>> [429 Reject] ip=" << client_ip_str << std::endl;
             reject_new_connection_with_429(client_fd); 
             continue;
@@ -79,6 +82,8 @@ void accept_new_connections(int epoll_fd, int listen_fd) {
             continue;
         }
         connections[client_fd] = Connection();
+        ++accept_total;
+        ++conns_current;
 
         Connection& conn = connections[client_fd];
         int64_t now_ms = now_ms_monotonic();

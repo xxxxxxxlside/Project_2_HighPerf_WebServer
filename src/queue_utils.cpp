@@ -65,6 +65,9 @@ void flush_pending_close_queue() {
             // =====================【Week2 Day4 新增】======================================
             // 真正 erase 前，把这个连接还占着的 buffer 字节数扣掉
             release_connection_buffers(it->second);
+            if (conns_current > 0) {
+                --conns_current;
+            }
 
             connections.erase(it);
         }

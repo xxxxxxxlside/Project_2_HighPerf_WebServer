@@ -75,6 +75,9 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
                 "HTTP/1.1 501 Not Implemented\r\n"
                 "Connection: close\r\n"
                 "\r\n";
+
+            ++reject_total;
+            ++reject_501_total;
             append_to_out_buffer(conn, err_resp);
             // =============================================
             conn.is_closing = true;
@@ -107,6 +110,8 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
                 "HTTP/1.1 411 Length Required\r\n"
                 "Connection: close\r\n"
                 "\r\n";
+            ++reject_total;
+            ++reject_411_total;
             append_to_out_buffer(conn, err_resp);
             conn.is_closing = true;
             break;
@@ -120,6 +125,9 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
                 "HTTP/1.1 413 Payload Too Large\r\n"
                 "Connection: close\r\n"
                 "\r\n";
+            
+            ++reject_total;
+            ++reject_413_total;
             append_to_out_buffer(conn, err_resp);
             conn.is_closing = true;
             break;
@@ -157,7 +165,8 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
 
             ++conn.body_timer_version;   // 让旧的 body timeout 节点失效
         }
-
+        
+        ++requests_total;
         handle_request(fd,conn, request_line);
 
         // =====================【Week2 Day4 修改】==============================
@@ -206,6 +215,9 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
                     "HTTP/1.1 503 Service Unavailable\r\n"
                     "Connection: close\r\n"
                     "\r\n";
+
+                ++reject_total;
+                ++reject_503_total;
                 append_to_out_buffer(conn, err_resp);
                 conn.is_closing = true;
                 break;
@@ -223,6 +235,9 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
                     "HTTP/1.1 431 Request Header Fields Too Large\r\n"
                     "Connection: close\r\n"
                     "\r\n";
+                
+                ++reject_total;
+                ++reject_431_total;
                 append_to_out_buffer(conn, err_resp);
                 // =====================================================
                 conn.is_closing = true;
@@ -244,6 +259,7 @@ void read_with_budget(int epoll_fd, int fd, Connection& conn, bool& io_error) {
             // 当前 socket 已经没数据了
             break;
         } else {
+            ++errors_total;
             io_error = true;
             break;
         }
