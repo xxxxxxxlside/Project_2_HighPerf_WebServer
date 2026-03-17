@@ -1,3 +1,7 @@
+// 队列与延迟关闭模块
+// 负责 ReadyQueue 和 pending_close_queue 的管理：
+// 包括连接入队、移除、请求关闭，以及统一释放待关闭连接。
+
 #ifndef QUEUE_UTILS_H
 #define QUEUE_UTILS_H
 

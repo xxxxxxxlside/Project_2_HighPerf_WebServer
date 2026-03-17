@@ -1,3 +1,7 @@
+// 连接与全局状态模块
+// 负责定义 Connection 结构体，以及服务器运行时用到的全局连接数据：
+// 如 connections、ready_queue、pending_close_queue、全局 inflight 统计等。
+
 #ifndef CONNECTION_H
 #define CONNECTION_H
 

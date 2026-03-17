@@ -1,3 +1,7 @@
+// IP 限流模块
+// 负责基于 Token Bucket 的 IP 访问限流：
+// 包括令牌补充、令牌消耗、过期桶清理、LRU 管理，以及超限时返回 429。
+
 #ifndef IP_RATE_LIMIT_H
 #define IP_RATE_LIMIT_H
 

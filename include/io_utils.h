@@ -1,3 +1,7 @@
+// IO 控制模块
+// 负责与 epoll 和写回相关的底层 IO 逻辑：
+// 包括更新 epoll 关注事件，以及按预算尽力发送输出缓冲区数据。
+
 #ifndef IO_UTILS_H
 #define IO_UTILS_H
 
