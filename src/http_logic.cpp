@@ -1,25 +1,57 @@
-// 这个文件负责 HTTP 读入、解析和响应生成，本次还修了错误响应可能发不出去的收尾问题。
+// 这个文件负责 HTTP 读入、解析和响应生成，本次还补了 day5 需要的 keep-alive 复用逻辑。
 #include "http_logic.h"
 #include "buffer_utils.h"
 #include "queue_utils.h"
 #include "io_utils.h"
 #include "timer_utils.h"
 
+#include <algorithm>
 #include <iostream>
+#include <cctype>
 #include <cstring>
 #include <unistd.h>
 
+namespace {
+bool contains_case_insensitive(const std::string& text, const std::string& needle) {
+    return std::search(
+        text.begin(),
+        text.end(),
+        needle.begin(),
+        needle.end(),
+        [](unsigned char lhs, unsigned char rhs) {
+            return std::tolower(lhs) == std::tolower(rhs);
+        }
+    ) != text.end();
+}
 
-void handle_request(int fd, Connection& conn, const std::string& request_line) {
+// day5 的复用率验证依赖 keep-alive。
+// 这里按最小规则处理：
+// 1. HTTP/1.1 默认 keep-alive，除非显式 Connection: close
+// 2. HTTP/1.0 默认 close，除非显式 Connection: keep-alive
+bool should_keep_alive(const std::string& request_line, const std::string& headers) {
+    if (contains_case_insensitive(headers, "Connection: close")) {
+        return false;
+    }
+
+    if (request_line.find("HTTP/1.1") != std::string::npos) {
+        return true;
+    }
+
+    return contains_case_insensitive(headers, "Connection: keep-alive");
+}
+}
+
+void handle_request(int fd, Connection& conn, const std::string& request_line, bool keep_alive) {
     // 当前 MVP 业务很简单：收到完整合法请求后返回固定 200 OK。
+    // day5 起对合法请求尽量保持连接，方便 wrk/自测验证连接复用率。
     std::cout << ">>> [Request] FD " << fd << " Method-Line: " << request_line << std::endl;
 
     std::string resp = 
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: 2\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "OK";
+        + std::string("Connection: ") + (keep_alive ? "keep-alive" : "close") + "\r\n"
+        + "\r\n"
+        + "OK";
     
     // =====================【Week2 Day4 新增】======================================
     // 不再直接 out_buffer += resp
@@ -33,12 +65,13 @@ void handle_request(int fd, Connection& conn, const std::string& request_line) {
             "Connection: Close\r\n"
             "\r\n";
         append_to_out_buffer(conn, err_resp);
+        keep_alive = false;
     }
 
-    
-    conn.is_closing = true;
+    conn.is_closing = !keep_alive;
 }
 
+// 在预算内尽量多处理完整请求；若连接保持活跃，后续请求继续复用同一个 fd。
 void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
     int processed = 0;
 
@@ -102,6 +135,7 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
 
         bool is_post = request_line.rfind("POST ", 0) == 0;
         bool has_content_length = (cl_pos != std::string::npos);
+        bool keep_alive = should_keep_alive(request_line, headers);
 
         if (is_post && !has_content_length) {
             std::cerr << ">>> [Protocol] POST without Content-Length on FD "
@@ -168,7 +202,7 @@ void process_requests_with_limit(int epoll_fd, int fd, Connection& conn) {
         }
         
         ++requests_total;
-        handle_request(fd,conn, request_line);
+        handle_request(fd, conn, request_line, keep_alive);
 
         // =====================【Week2 Day4 修改】==============================
         // 不再直接 erase in_buffer, 改成统一扣减 inflight 计数

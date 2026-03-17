@@ -74,7 +74,6 @@ import socket
 import sys
 import threading
 import time
-import errno
 
 DURATION_SEC = float(sys.argv[1])
 HOST = "127.0.0.1"
@@ -85,28 +84,45 @@ stop_event = threading.Event()
 
 
 def recv_all(sock):
-    chunks = []
-    while True:
+    data = b""
+    while b"\r\n\r\n" not in data:
         try:
-            data = sock.recv(4096)
+            chunk = sock.recv(4096)
         except TimeoutError:
             break
         except ConnectionResetError:
             break
-        if not data:
+        if not chunk:
             break
-        chunks.append(data)
-    return b"".join(chunks)
+        data += chunk
+
+    if b"\r\n\r\n" not in data:
+        return data
+
+    header_bytes, body = data.split(b"\r\n\r\n", 1)
+    content_length = 0
+    for line in header_bytes.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1].strip())
+            break
+
+    while len(body) < content_length:
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            break
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        body += chunk
+
+    return header_bytes + b"\r\n\r\n" + body[:content_length]
 
 
 def request(raw: bytes) -> bytes:
     with socket.create_connection((HOST, PORT), timeout=2.0) as sock:
         sock.sendall(raw)
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError as exc:
-            if exc.errno != errno.ENOTCONN:
-                raise
         return recv_all(sock)
 
 
